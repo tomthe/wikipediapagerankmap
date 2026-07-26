@@ -1,0 +1,72 @@
+# Project and prompt
+
+I created a map of geolocated wikipedia articles, where the size of a label is 
+relative to the "importance" of an article.
+The data is created from wikidata dump and pagerank datasets. Then converted into tiles.
+
+I lost the code to process the data and create the tiles. 
+
+I want to improve the data and the website (index.html)
+
+* recreate the data pipeline: 
+ * create one big parquet file with all geolocated articles and
+  * wikidata identifiers
+  * wikipedia title (english, original)
+  * coordinates (correct!)
+  * categorie of the thing (so that I can filter the map later!)
+  * importance
+    * pagerank
+    * Qrank
+    * combination
+    * ?
+  * more information about the thing
+   * ?
+ * create tiles from that parquet
+  * maybe a better format than before? better compressed? Faster to read?
+  * of course the website needs to be able to read it
+  * the website code was not perfect: sometimes too much data was loaded. sometimes data disappears.... this could be improved
+  * 
+* improve the website
+ * show categories and even subcategories
+ * improve tile-loading and data handling
+ * Improve links and hover information
+
+* maybe improve the search... but this is difficult. Maybe with another prepared data pipeline, which creates 
+  an index (aaa.json contains all the words+coordinates that begin with aaa... ? )
+
+
+
+
+## Downloaded data
+
+available in G:\tt\wikidata
+I downloaded wikidump truthy (maybe not complete yet? might be ready in 30 minutes), danker PareRank and Qrank
+
+# Data info internet
+
+Yes — and there's a dataset that makes the Wikidata join essentially free, because it's already keyed by Q-ID.
+The best fit: danker
+danker computes PageRank over Wikipedia's internal link graph and outputs a TSV of Wikidata Q-IDs with their PageRank score, sorted descending. It downloads the Wikimedia dump files, resolves links, redirects, and Q-IDs itself, and pre-computed outputs are published at https://danker.s3.amazonaws.com/index.html under CC BY-SA 3.0. Files are named like 2022-11-10.allwiki.links.rank.bz2. GitHubgithub
+Two flavors matter for you:
+
+Single language (e.g. en) — the classic "PageRank of English Wikipedia."
+ALL — links from every language edition, aligned via each article's Wikidata Q-ID, using what the author calls a bag-of-links model: a link that appears in 254 language editions counts 254 times, so each language edition acts as a voting entity. For a geographic notability signal this is usually what you want — it captures global prominence rather than anglophone prominence. GitHubgithub
+
+The raw edge list is also published separately if you'd rather run your own algorithm: a Wikipedia link graph with all article identifiers normalized to Q-IDs, containing links from all language versions, on Zenodo. Zenodo
+One caveat on the scores: danker does not compute the normalized version of PageRank — it uses (1 - damping) rather than (1 - damping)/N, so scores don't sum to 1. Ranking is unaffected, but don't treat the numbers as probabilities. github
+Alternatives
+WikiLinkGraphs if you want a cleaner or historical graph: yearly snapshots of the internal link network for the 9 largest language editions, 2001 to March 2018, parsed from article wikitext so that template-generated links are excluded — discarding more than half the links and keeping only those editors intentionally added. Downloadable from Zenodo (doi:10.5281/zenodo.2539424). Keyed by page_id/page_title, so you'd need a sitelinks join, and it stops at 2018. arXivConsonni
+QRank if "importance" rather than "PageRank" is the real goal. It's built from Wikimedia pageviews aggregated over twelve months, joined to Q-IDs via the sitelinks in the Wikidata dump. It was designed for exactly your kind of use case (deciding which map features deserve labels), and pageviews arguably beat link structure for that. GitHub
+Roll your own from pagelinks.sql.gz + page.sql.gz + redirect.sql.gz. Doable but note the pagelinks schema changed a few years back — link targets moved into a separate linktarget table, so older tutorials showing pl_title/pl_namespace no longer apply. Worth verifying against the current dump before writing the parser.
+Getting the coordinates
+Wikidata property P625 (coordinate location). Three routes, roughly in order of practicality:
+
+Truthy dump grep — download latest-truthy.nt.bz2 and filter for the P625 predicate. Streams in one pass, gives you ~10M rows, no query timeouts:
+
+   bzcat latest-truthy.nt.bz2 | grep -F 'prop/direct/P625>'
+
+QLever's public Wikidata endpoint — handles full-dataset SPARQL scans that WDQS will time out on. Good for SELECT ?item ?coord WHERE { ?item wdt:P625 ?coord }.
+WDQS — fine if you're slicing by country or class, will time out on the unrestricted query.
+
+Gotcha: P625 serializes as WKT, Point(lon lat) — longitude first. Swapping these is the single most common bug in this pipeline.
+Then it's a plain join on Q-ID. Two analytical notes: filter to the geo subset first and re-rank within it, since raw PageRank is dominated by countries, years, and languages; and be aware that "Portugal" and "1994" both carry enormous PageRank while a specific mountain won't — so the score distribution across geographic entity types is wildly skewed, and you may want to normalize within P31 class.
