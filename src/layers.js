@@ -14,9 +14,14 @@ const { TextLayer, ScatterplotLayer, LineLayer } = deck;
 
 const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", sans-serif';
 
-// log10 of a bit more than the largest real population, so the busiest place
-// on Earth lands just under 1 and the scale does not depend on outliers.
-const POP_LOG_MAX = 9.5;
+// log10 bounds the population term is stretched across. Anchoring the low end
+// at a real floor (a small town, not zero) instead of log10(1) means that
+// range - where the vast majority of populated items actually live - gets
+// most of the 0..1 span, so the slider visibly separates a village from a
+// metropolis instead of bunching everything into a narrow middle band. A
+// handful of country-scale entries exceed the top and simply clip at 1.
+const POP_LOG_MIN = 3; // 1,000
+const POP_LOG_MAX = 8; // 100,000,000
 
 // Below this the label is close enough to its dot to be unambiguous.
 const LEADER_MIN_PX = 12;
@@ -37,7 +42,10 @@ export function importanceOf(item, qrankWeight) {
 export function weightOf(item, qrankWeight, populationWeight) {
   const importance = importanceOf(item, qrankWeight);
   if (!populationWeight || item.pop == null) return importance;
-  const scaled = Math.min(1, Math.log10(1 + item.pop) / POP_LOG_MAX);
+  const scaled = Math.max(
+    0,
+    Math.min(1, (Math.log10(1 + item.pop) - POP_LOG_MIN) / (POP_LOG_MAX - POP_LOG_MIN))
+  );
   return importance * (1 - populationWeight) + scaled * populationWeight;
 }
 
