@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wikipedia importance map</title>
+  <meta name="description" content="Every geolocated Wikipedia article, sized by PageRank and QRank." />
+  <!-- Inline so it costs no request and never 404s. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232a78d6'/%3E%3Ccircle cx='11' cy='12' r='3.4' fill='%23fff'/%3E%3Ccircle cx='21' cy='19' r='2.2' fill='%23fff'/%3E%3Ccircle cx='13' cy='22' r='1.5' fill='%23fff'/%3E%3C/svg%3E" />
+
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.1/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@5.6.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.3.7/dist.min.js"></script>
+
+  <style>
+    :root {
+      color-scheme: light;
+      --surface: #f8f8f6;
+      --panel: rgba(255, 255, 255, 0.92);
+      --panel-solid: #ffffff;
+      --ink: #0b0b0b;
+      --ink-2: #52514e;
+      --ink-3: #898781;
+      --hairline: #e1e0d9;
+      --ring: rgba(11, 11, 11, 0.10);
+      --accent: #2a78d6;
+      --shadow: 0 2px 12px rgba(11, 11, 11, 0.12);
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --surface: #0e0e0e;
+      --panel: rgba(26, 26, 25, 0.92);
+      --panel-solid: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --ink-3: #898781;
+      --hairline: #2c2c2a;
+      --ring: rgba(255, 255, 255, 0.12);
+      --accent: #3987e5;
+      --shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    body {
+      font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--surface);
+    }
+    #map { position: absolute; inset: 0; }
+
+    .panel {
+      position: absolute;
+      background: var(--panel);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--ring);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+    }
+
+    /* ---- left control panel ---- */
+    #controls {
+      top: 12px; left: 12px; width: min(306px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      display: flex; flex-direction: column;
+      z-index: 10;
+    }
+    #controls header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px 8px;
+    }
+    #controls h1 {
+      font-size: 13px; font-weight: 600; margin: 0; flex: 1;
+      letter-spacing: -0.01em;
+    }
+    .icon-btn {
+      border: 1px solid var(--ring); background: transparent; color: var(--ink-2);
+      border-radius: 6px; width: 26px; height: 24px; cursor: pointer;
+      font-size: 13px; line-height: 1; display: grid; place-items: center;
+      flex: none;
+    }
+    .icon-btn:hover { background: var(--hairline); color: var(--ink); }
+    a.icon-btn { text-decoration: none; }
+
+    #collapse-btn { transition: transform .15s; }
+    #controls.collapsed #collapse-btn { transform: rotate(-90deg); }
+    /* Collapsed: only the header bar (title + buttons) remains visible, so
+       the panel reads as a small pill instead of covering the map. */
+    #controls.collapsed .search-wrap,
+    #controls.collapsed .scroll,
+    #controls.collapsed .attribution {
+      display: none;
+    }
+
+    .attribution {
+      margin: 0; padding: 0 12px 10px; font-size: 11px; color: var(--ink-3);
+    }
+    .attribution a {
+      color: var(--ink-2); text-decoration: none;
+      border-bottom: 1px dotted var(--ink-3);
+    }
+    .attribution a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
+    .search-wrap { padding: 0 12px 10px; position: relative; }
+    #search {
+      width: 100%; padding: 7px 9px; font: inherit;
+      color: var(--ink); background: var(--panel-solid);
+      border: 1px solid var(--hairline); border-radius: 7px;
+    }
+    #search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    #results {
+      position: absolute; left: 12px; right: 12px; top: 100%;
+      background: var(--panel-solid); border: 1px solid var(--ring);
+      border-radius: 8px; box-shadow: var(--shadow);
+      max-height: 320px; overflow-y: auto; display: none; z-index: 20;
+    }
+    #results.open { display: block; }
+    .result {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--hairline);
+    }
+    .result:last-child { border-bottom: 0; }
+    .result:hover, .result[aria-selected="true"] { background: var(--hairline); }
+    .result .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .result .cat { font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+
+    .scroll { overflow-y: auto; padding: 0 12px 12px; }
+
+    .section-title {
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--ink-3);
+      margin: 12px 0 6px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .section-title button {
+      margin-left: auto; border: 0; background: none; color: var(--accent);
+      font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0;
+      cursor: pointer; padding: 0;
+    }
+
+    .cat-row { display: flex; align-items: center; gap: 7px; padding: 2px 0; }
+    .cat-row .twisty {
+      border: 0; background: none; cursor: pointer; color: var(--ink-3);
+      width: 14px; padding: 0; font-size: 9px; line-height: 1;
+    }
+    .cat-row label { display: flex; align-items: center; gap: 7px; flex: 1; cursor: pointer; min-width: 0; }
+    .cat-row .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cat-row .count { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+    .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+    .subs { margin: 2px 0 6px 27px; display: none; }
+    .subs.open { display: block; }
+    .subs label {
+      display: flex; align-items: center; gap: 6px; padding: 1px 0;
+      color: var(--ink-2); cursor: pointer;
+    }
+    input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+
+    .slider-row { display: grid; grid-template-columns: 1fr auto; gap: 4px; margin: 8px 0; }
+    .slider-row label { font-size: 12px; color: var(--ink-2); }
+    .slider-row output { font-size: 11px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+    .slider-row input { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+    .hint { font-size: 11px; color: var(--ink-3); margin: 2px 0 0; }
+
+    /* ---- status bar ---- */
+    #status {
+      bottom: 12px; left: 12px; padding: 6px 10px;
+      font-size: 11px; color: var(--ink-2);
+      font-variant-numeric: tabular-nums;
+      display: flex; gap: 10px; align-items: center; z-index: 10;
+    }
+    #status .dot {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+      opacity: 0; transition: opacity .15s;
+    }
+    #status.busy .dot { opacity: 1; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: .25; } }
+
+    /* ---- detail panel ---- */
+    #detail {
+      top: 12px; right: 12px; width: min(320px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px); overflow-y: auto;
+      display: none; z-index: 10;
+    }
+    #detail.open { display: block; }
+    #detail .close {
+      position: absolute; top: 8px; right: 8px;
+    }
+    #detail .body { padding: 12px 14px; }
+    #detail h2 { font-size: 15px; margin: 0 6px 2px 0; padding-right: 22px; line-height: 1.3; }
+    #detail .meta { font-size: 11px; color: var(--ink-3); margin-bottom: 8px; }
+    #detail img {
+      width: 100%; border-radius: 7px; margin: 6px 0 8px; display: block;
+      background: var(--hairline);
+    }
+    #detail .extract { color: var(--ink-2); margin: 0 0 10px; }
+    #detail dl {
+      display: grid; grid-template-columns: auto 1fr; gap: 2px 10px;
+      margin: 0 0 10px; font-size: 12px;
+    }
+    #detail dt { color: var(--ink-3); }
+    #detail dd { margin: 0; }
+    .links { display: flex; flex-wrap: wrap; gap: 6px; }
+    .links a {
+      font-size: 12px; text-decoration: none; color: var(--accent);
+      border: 1px solid var(--ring); border-radius: 6px; padding: 3px 8px;
+    }
+    .links a:hover { background: var(--hairline); }
+
+    #tooltip {
+      position: absolute; pointer-events: none; z-index: 30;
+      background: var(--panel-solid); border: 1px solid var(--ring);
+      border-radius: 7px; box-shadow: var(--shadow);
+      padding: 6px 10px; font-size: 12px; max-width: 280px; display: none;
+    }
+    #tooltip .t-name { font-weight: 600; }
+    #tooltip .t-meta { color: var(--ink-3); font-size: 11px; }
+    #tooltip .t-descr { color: var(--ink-2); font-size: 11.5px; margin: 3px 0 2px; }
+    #tooltip .t-rank {
+      color: var(--ink-3); font-size: 10.5px; margin-top: 3px;
+      padding-top: 3px; border-top: 1px solid var(--hairline);
+      font-variant-numeric: tabular-nums;
+    }
+
+    #loading {
+      position: absolute; inset: 0; display: grid; place-items: center;
+      background: var(--surface); z-index: 50; font-size: 13px; color: var(--ink-2);
+    }
+    #loading.hidden { display: none; }
+    .maplibregl-ctrl-attrib { font-size: 10px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls" class="panel">
+    <header>
+      <h1>Wikipedia importance map</h1>
+      <button class="icon-btn" id="theme-btn" title="Toggle light / dark">◐</button>
+      <button class="icon-btn" id="collapse-btn" title="Collapse / expand panel" aria-expanded="true">▾</button>
+    </header>
+
+    <p class="attribution">Based on <a href="https://github.com/athalhammer/danker">Danker PageRank</a> 
+      and <a href="https://qrank.wmcloud.org/">Qrank Pageviews</a>·
+      <a href="https://github.com/tomthe/wikipediapagerankmap">source</a>
+    </p>
+
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="Search places…" autocomplete="off"
+             spellcheck="false" aria-label="Search places" />
+      <div id="results" role="listbox"></div>
+    </div>
+
+    <div class="scroll">
+      <div class="section-title">
+        Categories
+        <button id="cat-all" type="button">all / none</button>
+      </div>
+      <div id="categories"></div>
+
+      <div class="section-title">Importance</div>
+      <div class="slider-row">
+        <label for="weight">PageRank ↔ Pageviews</label>
+        <output id="weight-out">balanced</output>
+        <input id="weight" type="range" min="0" max="100" value="50" />
+      </div>
+      <div class="slider-row">
+        <label for="population">Size by population</label>
+        <output id="population-out">off</output>
+        <input id="population" type="range" min="0" max="100" value="0" />
+      </div>
+      <div class="slider-row">
+        <label for="labelscale">Label size</label>
+        <output id="labelscale-out">1.3×</output>
+        <input id="labelscale" type="range" min="50" max="200" value="130" />
+      </div>
+
+      <div class="section-title">Crowding</div>
+      <div class="slider-row">
+        <label for="maxscore">Maximum importance</label>
+        <output id="maxscore-out">all</output>
+        <input id="maxscore" type="range" min="0" max="100" value="100" />
+      </div>
+      <p class="hint">Turn it down to hide the loudest places and read what is
+        underneath them.</p>
+      <div class="slider-row">
+        <label for="labelbudget">Label density</label>
+        <output id="labelbudget-out">300</output>
+        <input id="labelbudget" type="range" min="50" max="1500" step="50" value="300" />
+      </div>
+      <label class="cat-row" style="margin-top:6px">
+        <input type="checkbox" id="spread" checked />
+        <span class="name">Move crowded labels aside</span>
+      </label>
+      <label class="cat-row">
+        <input type="checkbox" id="show-all" />
+        <span class="name">Show all labels, overlapping</span>
+      </label>
+      <label class="cat-row">
+        <input type="checkbox" id="color-by-cat" checked/>
+        <span class="name">Colour labels by category</span>
+      </label>
+      <p class="hint" id="search-note"></p>
+      <p class="hint" id="data-note"></p>
+    </div>
+  </div>
+
+  <div id="status" class="panel"><span class="dot"></span><span id="status-text">starting…</span></div>
+
+  <aside id="detail" class="panel">
+    <button class="icon-btn close" id="detail-close" title="Close">✕</button>
+    <div class="body" id="detail-body"></div>
+  </aside>
+
+  <div id="tooltip"></div>
+  <div id="loading">loading map data…</div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
