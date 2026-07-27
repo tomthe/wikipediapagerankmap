@@ -80,15 +80,26 @@
       flex: none;
     }
     .icon-btn:hover { background: var(--hairline); color: var(--ink); }
+    a.icon-btn { text-decoration: none; }
 
     #collapse-btn { transition: transform .15s; }
     #controls.collapsed #collapse-btn { transform: rotate(-90deg); }
     /* Collapsed: only the header bar (title + buttons) remains visible, so
        the panel reads as a small pill instead of covering the map. */
     #controls.collapsed .search-wrap,
-    #controls.collapsed .scroll {
+    #controls.collapsed .scroll,
+    #controls.collapsed .attribution {
       display: none;
     }
+
+    .attribution {
+      margin: 0; padding: 0 12px 10px; font-size: 11px; color: var(--ink-3);
+    }
+    .attribution a {
+      color: var(--ink-2); text-decoration: none;
+      border-bottom: 1px dotted var(--ink-3);
+    }
+    .attribution a:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
     .search-wrap { padding: 0 12px 10px; position: relative; }
     #search {
@@ -227,6 +238,11 @@
       <button class="icon-btn" id="theme-btn" title="Toggle light / dark">◐</button>
       <button class="icon-btn" id="collapse-btn" title="Collapse / expand panel" aria-expanded="true">▾</button>
     </header>
+
+    <p class="attribution">Based on <a href="https://github.com/athalhammer/danker">Danker PageRank</a> 
+      and <a href="https://qrank.wmcloud.org/">Qrank Pageviews</a>·
+      <a href="https://github.com/tomthe/wikipediapagerankmap">source</a>
+    </p>
 
     <div class="search-wrap">
       <input id="search" type="search" placeholder="Search places…" autocomplete="off"

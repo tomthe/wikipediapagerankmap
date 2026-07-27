@@ -1,4 +1,4 @@
-# Wikipedia importance map
+# Wikipedia PageRank map
 
 Every geolocated Wikipedia article on a map, with label size driven by how
 important the subject is. Importance combines two independent signals:
