@@ -1,20 +1,22 @@
-// Prefix search against the static shards built by pipeline/build_search.py.
+// Prefix search against the packed shards built by pipeline/build_search.py.
 //
-// Typing fetches exactly one small JSON file - the shard for the longest
-// prefix that exists (3 characters, else 2, else 1) - and filters inside it.
-// The index never loads as a whole, and there is no server.
+// Three range requests at most, and usually one. The root file says where each
+// first character's directory lives; the directory says where each of that
+// letter's shards lives; the shard is a gzipped list of entries. Directories
+// are cached, so after the first "b" every b-query is a single request for a
+// few kilobytes.
+//
+// The index only holds items above an importance floor (see build_search.py),
+// so a search that finds nothing usually means the thing is too obscure to be
+// worth a row rather than that the query was wrong - which is what the status
+// line says.
+
+import { Pack } from "./pack.js";
+import { maybeGunzip } from "./decode.js";
 
 const MAX_RESULTS = 12;
 
-// Must match RESERVED_NAMES in pipeline/build_search.py: Windows cannot hold a
-// file called con.json, so those shards are written with a trailing underscore.
-const RESERVED_NAMES = new Set([
-  "con", "prn", "aux", "nul",
-  ...Array.from({ length: 10 }, (_, i) => `com${i}`),
-  ...Array.from({ length: 10 }, (_, i) => `lpt${i}`),
-]);
-
-const shardFile = (prefix) => (RESERVED_NAMES.has(prefix) ? `${prefix}_` : prefix);
+const decoder = new TextDecoder("utf-8");
 
 /** Must match normalise() in pipeline/build_search.py. */
 export function normalise(text) {
@@ -26,19 +28,37 @@ export function normalise(text) {
     .trim();
 }
 
+/** uint32 count, uint32 prefixOff[count+1], uint32 length[count], utf8 names. */
+export function decodeDirectory(buffer, base) {
+  const count = new Uint32Array(buffer, 0, 1)[0];
+  const nameOff = new Uint32Array(buffer, 4, count + 1);
+  const lengths = new Uint32Array(buffer, 4 + 4 * (count + 1), count);
+  const names = new Uint8Array(buffer, 4 + 4 * (count + 1) + 4 * count);
+  const map = new Map();
+  let running = base;
+  for (let i = 0; i < count; i++) {
+    map.set(decoder.decode(names.subarray(nameOff[i], nameOff[i + 1])), [
+      running,
+      lengths[i],
+    ]);
+    running += lengths[i];
+  }
+  return map;
+}
+
 export class Search {
-  constructor({ baseUrl, manifest, categories, input, results, onPick }) {
-    this.baseUrl = baseUrl;
+  constructor({ baseUrl, root, categories, countries, input, results, onPick }) {
+    this.pack = new Pack({ baseUrl, info: root.pack });
+    this.letters = root.letters ?? {};
+    this.rare = root.rare ?? null;
+    this.minScore = root.minScore ?? 0;
     this.categories = categories;
+    this.countries = countries ?? [];
     this.input = input;
     this.results = results;
     this.onPick = onPick;
-    this.prefixes = {
-      1: new Set(manifest.prefixes["1"]),
-      2: new Set(manifest.prefixes["2"]),
-      3: new Set(manifest.prefixes["3"]),
-    };
-    this.shards = new Map();
+    this.directories = new Map(); // letter -> Promise<Map>
+    this.shards = new Map();      // "off:len" -> Promise<entries>
     this.token = 0;
     this.active = -1;
     this.current = [];
@@ -75,19 +95,42 @@ export class Search {
     });
   }
 
+  /** prefix -> [offset, length], for every shard under one first character. */
+  directoryFor(letter) {
+    const known = Object.prototype.hasOwnProperty.call(this.letters, letter);
+    const key = known ? letter : this.rare;
+    if (key === null || !Object.prototype.hasOwnProperty.call(this.letters, key)) {
+      return Promise.resolve(null);
+    }
+    if (!this.directories.has(key)) {
+      const [base, offset, length] = this.letters[key];
+      this.directories.set(
+        key,
+        this.pack
+          .read(offset, length)
+          .then(maybeGunzip)
+          .then((buffer) => decodeDirectory(buffer, base))
+          .catch(() => null)
+      );
+    }
+    return this.directories.get(key);
+  }
+
   async shardFor(query) {
+    const directory = await this.directoryFor(query[0]);
+    if (!directory) return [];
     for (const level of [3, 2, 1]) {
       if (query.length < level) continue;
-      const prefix = query.slice(0, level);
-      if (!this.prefixes[level].has(prefix)) continue;
-      const key = `${level}/${prefix}`;
+      const where = directory.get(query.slice(0, level));
+      if (!where) continue;
+      const key = `${where[0]}:${where[1]}`;
       if (!this.shards.has(key)) {
         this.shards.set(
           key,
-          fetch(
-            `${this.baseUrl}/search/${level}/${encodeURIComponent(shardFile(prefix))}.json`
-          )
-            .then((r) => (r.ok ? r.json() : []))
+          this.pack
+            .read(where[0], where[1])
+            .then(maybeGunzip)
+            .then((buffer) => JSON.parse(decoder.decode(new Uint8Array(buffer))))
             .catch(() => [])
         );
       }
@@ -123,7 +166,7 @@ export class Search {
     this.results.textContent = "";
     if (!this.current.length) return this.close();
     this.current.forEach((entry, i) => {
-      const [name, , , , , cat] = entry;
+      const [name, , , , , cat, country] = entry;
       const row = document.createElement("div");
       row.className = "result";
       row.setAttribute("role", "option");
@@ -139,7 +182,9 @@ export class Search {
 
       const kind = document.createElement("span");
       kind.className = "cat";
-      kind.textContent = this.categories.categories[cat]?.name ?? "";
+      // Two Springfields look identical without the country.
+      kind.textContent =
+        this.countries[country] ?? this.categories.categories[cat]?.name ?? "";
 
       row.append(swatch, label, kind);
       row.addEventListener("mousedown", (event) => {

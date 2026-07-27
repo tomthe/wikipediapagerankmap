@@ -3,8 +3,8 @@
 The tile format is written in one language and read in another, so the only
 check worth having is one that runs both. This encodes awkward tiles (odd row
 counts, which exercise the alignment padding; astral-plane and RTL titles;
-items with and without an English article) and asserts the browser decoder
-reproduces them exactly.
+items with and without an English article; every optional field present and
+absent) and asserts the browser decoder reproduces them exactly.
 
     python -m tests.test_tile_format
 
@@ -24,9 +24,18 @@ from pathlib import Path
 
 import numpy as np
 
-from pipeline.build_tiles import FLAG_HAS_IMAGE, FLAG_HAS_WIKI, encode_tile
+from pipeline.build_tiles import (
+    FLAG_HAS_IMAGE,
+    FLAG_HAS_WEBSITE,
+    FLAG_HAS_WIKI,
+    NO_INT16,
+    NO_POP,
+    NO_REF,
+    encode_tile,
+)
 
 REPO = Path(__file__).resolve().parent.parent
+COUNTRIES = ["United Kingdom", "Japan", "Israel", "Germany", "Philippines", "France"]
 
 
 def find_node() -> tuple[list[str], dict[str, str]]:
@@ -46,52 +55,110 @@ def find_node() -> tuple[list[str], dict[str, str]]:
     sys.exit("no JS runtime found; set NODE_BIN to a node executable")
 
 
+def row(
+    qid,
+    lon,
+    lat,
+    score,
+    pr,
+    qr,
+    cat,
+    sub,
+    flags,
+    title,
+    wiki,
+    *,
+    descr="",
+    admin="",
+    country=NO_REF,
+    pop=NO_POP,
+    elev=NO_INT16,
+    year=NO_INT16,
+    sitelinks=0,
+) -> dict:
+    return dict(
+        qid=qid, lon=lon, lat=lat, score=score, pr=pr, qr=qr, cat=cat, sub=sub,
+        flags=flags, title=title, wiki=wiki, descr=descr, admin=admin,
+        country=country, pop=pop, elev=elev, year=year, sitelinks=sitelinks,
+    )
+
+
 CASES = [
     {
-        "name": "odd row count with unicode",
+        "name": "unicode, and every optional field used",
+        # "en|" = English article whose title equals the drawn label
         "rows": [
-            # (qid, lon, lat, score, pr, qr, cat, sub, flags, title, wiki)
-            # "en|" = English article whose title equals the drawn label
-            (90, -0.1276, 51.5072, 65535, 60000, 64000, 1, 2, FLAG_HAS_WIKI | FLAG_HAS_IMAGE, "London", "en|"),
-            (1490, 139.6917, 35.6895, 65000, 59000, 65535, 1, 2, FLAG_HAS_WIKI, "東京", "en|Tokyo"),
-            (3766, 34.7818, 32.0853, 40000, 30000, 35000, 1, 2, FLAG_HAS_WIKI, "תל אביב", "en|Tel Aviv"),
+            row(90, -0.1276, 51.5072, 65535, 60000, 64000, 1, 2,
+                FLAG_HAS_WIKI | FLAG_HAS_IMAGE | FLAG_HAS_WEBSITE, "London", "en|",
+                descr="capital of the United Kingdom", admin="Greater London",
+                country=0, pop=8866180, elev=11, year=47, sitelinks=255),
+            row(1490, 139.6917, 35.6895, 65000, 59000, 65535, 1, 2, FLAG_HAS_WIKI,
+                "東京", "en|Tokyo", descr="capital of Japan", admin="関東地方",
+                country=1, pop=13929286, elev=40, year=1457, sitelinks=254),
+            row(3766, 34.7818, 32.0853, 40000, 30000, 35000, 1, 2, FLAG_HAS_WIKI,
+                "תל אביב", "en|Tel Aviv", descr="city in Israel",
+                admin="Tel Aviv District", country=2, pop=460613, sitelinks=120),
             # only a non-English article, and the title differs from the label
-            (5678, 11.582, 48.1351, 30000, 20000, 25000, 1, 2, FLAG_HAS_WIKI, "Munich", "de|München"),
-            # a bot-made wiki with a longer language code
-            (91011, 121.0, 14.0, 900, 400, 500, 2, 1, FLAG_HAS_WIKI, "Barangay X", "ceb|"),
-            (12345, 2.3522, 48.8566, 100, 50, 70, 2, 1, 0, "Sans article 😀", ""),
-            (7, -74.006, 40.7128, 1, 0, 0, 0, 0, 0, "Q7 only", ""),
+            row(5678, 11.582, 48.1351, 30000, 20000, 25000, 1, 2, FLAG_HAS_WIKI,
+                "Munich", "de|München", descr="capital of Bavaria, Germany",
+                admin="Upper Bavaria", country=3, pop=1512491, elev=520, year=1158),
+            # a bot-made wiki with a longer language code, and no extras at all
+            row(91011, 121.0, 14.0, 900, 400, 500, 2, 1, FLAG_HAS_WIKI,
+                "Barangay X", "ceb|", country=4),
+            # below sea level, and a founding date BC
+            row(4242, 35.5, 31.5, 8000, 4000, 5000, 2, 0, 0, "Dead Sea shore", "",
+                descr="lowest land on Earth", elev=-11034, year=-800),
+            row(12345, 2.3522, 48.8566, 100, 50, 70, 2, 1, 0, "Sans article 😀", "",
+                descr="an item with an emoji in its name", country=5, admin="Île-de-France"),
+            row(7, -74.006, 40.7128, 1, 0, 0, 0, 0, 0, "Q7 only", ""),
         ],
     },
     {
-        "name": "single row",
-        "rows": [(1, 0.0, 0.0, 32768, 100, 200, 8, 3, FLAG_HAS_WIKI, "Null Island", "en|Null_Island")],
+        "name": "single row, no admin table",
+        "rows": [
+            row(1, 0.0, 0.0, 32768, 100, 200, 8, 3, FLAG_HAS_WIKI, "Null Island",
+                "en|Null_Island", pop=0)
+        ],
     },
     {
-        "name": "two rows, no articles",
+        # Three rows, so the u16 block is 14*3 bytes and the encoder has to pad
+        # before the u8 block. An even count hides that bug completely.
+        "name": "odd row count, sharing one admin area, values at the limits",
         "rows": [
-            (2, 180.0, -85.0, 5, 1, 2, 3, 0, 0, "Edge A", ""),
-            (3, -180.0, 85.0, 6, 2, 3, 4, 1, 0, "Edge B", ""),
+            row(2, 180.0, -85.0, 5, 1, 2, 3, 0, 0, "Edge A", "", admin="Nowhere"),
+            row(3, -180.0, 85.0, 6, 2, 3, 4, 1, 0, "Edge B", "", admin="Nowhere",
+                year=32767, elev=32767, pop=NO_POP - 1, sitelinks=255),
+            row(4, 0.0, 0.0, 7, 3, 4, 5, 2, 0, "Edge C", "", admin="Nowhere",
+                year=NO_INT16 + 1, elev=NO_INT16 + 1, pop=0),
         ],
     },
 ]
 
 
-def build(rows) -> tuple[bytes, list[dict]]:
-    cols = list(zip(*rows))
+def build(rows: list[dict]) -> tuple[bytes, list[dict]]:
+    def col(name, dtype):
+        return np.array([r[name] for r in rows], dtype=dtype)
+
     payload = encode_tile(
         {
-            "qid": np.array(cols[0], dtype=np.uint32),
-            "lon": np.array(cols[1], dtype=np.float64),
-            "lat": np.array(cols[2], dtype=np.float64),
-            "score": np.array(cols[3], dtype=np.uint16),
-            "pr": np.array(cols[4], dtype=np.uint16),
-            "qr": np.array(cols[5], dtype=np.uint16),
-            "cat": np.array(cols[6], dtype=np.uint8),
-            "sub": np.array(cols[7], dtype=np.uint8),
-            "flags": np.array(cols[8], dtype=np.uint8),
-            "title": list(cols[9]),
-            "wiki": list(cols[10]),
+            "qid": col("qid", np.uint32),
+            "lon": col("lon", np.float64),
+            "lat": col("lat", np.float64),
+            "score": col("score", np.uint16),
+            "pr": col("pr", np.uint16),
+            "qr": col("qr", np.uint16),
+            "pop": col("pop", np.uint32),
+            "country": col("country", np.uint16),
+            "elev": col("elev", np.int16),
+            "year": col("year", np.int16),
+            "sitelinks": col("sitelinks", np.uint8),
+            "cat": col("cat", np.uint8),
+            "sub": col("sub", np.uint8),
+            "flags": col("flags", np.uint8),
+            "title": [r["title"] for r in rows],
+            "wiki": [r["wiki"] for r in rows],
+            "descr": [r["descr"] for r in rows],
+            "admin": [r["admin"] for r in rows],
         },
         z=5,
         x=17,
@@ -100,24 +167,32 @@ def build(rows) -> tuple[bytes, list[dict]]:
     expected = []
     for r in rows:
         wiki = wiki_lang = None
-        if r[8] & FLAG_HAS_WIKI:
-            lang, _, article = r[10].partition("|")
+        if r["flags"] & FLAG_HAS_WIKI:
+            lang, _, article = r["wiki"].partition("|")
             wiki_lang = lang
-            wiki = article or r[9]
+            wiki = article or r["title"]
         expected.append(
             {
-                "qid": r[0],
-                "lon": round(float(np.float32(r[1])), 4),
-                "lat": round(float(np.float32(r[2])), 4),
-                "title": r[9],
+                "qid": r["qid"],
+                "lon": round(float(np.float32(r["lon"])), 4),
+                "lat": round(float(np.float32(r["lat"])), 4),
+                "title": r["title"],
                 "wiki": wiki,
                 "wikiLang": wiki_lang,
-                "hasImage": bool(r[8] & FLAG_HAS_IMAGE),
-                "cat": r[6],
-                "sub": r[7],
-                "score": round(r[3] / 65535, 3),
-                "pr": round(r[4] / 65535, 3),
-                "qr": round(r[5] / 65535, 3),
+                "descr": r["descr"],
+                "hasImage": bool(r["flags"] & FLAG_HAS_IMAGE),
+                "hasWebsite": bool(r["flags"] & FLAG_HAS_WEBSITE),
+                "cat": r["cat"],
+                "sub": r["sub"],
+                "pop": None if r["pop"] == NO_POP else r["pop"],
+                "elev": None if r["elev"] == NO_INT16 else r["elev"],
+                "year": None if r["year"] == NO_INT16 else r["year"],
+                "sitelinks": r["sitelinks"],
+                "country": None if r["country"] == NO_REF else COUNTRIES[r["country"]],
+                "admin": r["admin"] or None,
+                "score": round(r["score"] / 65535, 3),
+                "pr": round(r["pr"] / 65535, 3),
+                "qr": round(r["qr"] / 65535, 3),
             }
         )
     return payload, expected
@@ -127,12 +202,19 @@ def main() -> None:
     node, env = find_node()
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
+        countries_path = Path(tmp) / "countries.json"
+        countries_path.write_text(json.dumps(COUNTRIES), encoding="utf-8")
         for case in CASES:
             payload, expected = build(case["rows"])
             path = Path(tmp) / "tile.bin"
             path.write_bytes(payload)
             proc = subprocess.run(
-                node + [str(REPO / "tests" / "decode_tile.mjs"), str(path)],
+                node
+                + [
+                    str(REPO / "tests" / "decode_tile.mjs"),
+                    str(path),
+                    str(countries_path),
+                ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

@@ -29,7 +29,9 @@ const waiting = new Map();
 const consoleErrors = [];
 const exceptions = [];
 const failedRequests = [];
-const requests = { tiles: 0, search: 0, other: 0 };
+const abortedRequests = [];
+const urlOf = new Map();
+const requests = { tiles: 0, search: 0, basemap: 0, other: 0 };
 
 function send(method, params = {}) {
   const id = nextId++;
@@ -59,19 +61,28 @@ socket.addEventListener("message", (event) => {
           msg.params.exceptionDetails.text
       );
       break;
+    case "Network.requestWillBeSent":
+      urlOf.set(msg.params.requestId, msg.params.request.url);
+      break;
     case "Network.responseReceived": {
       const u = msg.params.response.url;
-      if (u.includes("/tiles/")) requests.tiles++;
-      else if (u.includes("/search/")) requests.search++;
+      if (/\/tiles\.\d+\.bin/.test(u)) requests.tiles++;
+      else if (/\/search\.(\d+\.bin|json)/.test(u)) requests.search++;
+      else if (u.includes("openfreemap.org")) requests.basemap++;
       else requests.other++;
       if (msg.params.response.status >= 400) {
         failedRequests.push(`${msg.params.response.status} ${u}`);
       }
       break;
     }
-    case "Network.loadingFailed":
-      failedRequests.push(`failed ${msg.params.errorText}`);
+    case "Network.loadingFailed": {
+      const u = urlOf.get(msg.params.requestId) ?? `(${msg.params.type ?? "?"})`;
+      // Aborting a tile that scrolled out of view is the design, not a fault
+      // (see TileManager.update), so count those separately.
+      if (msg.params.errorText === "net::ERR_ABORTED") abortedRequests.push(u);
+      else failedRequests.push(`${msg.params.errorText} ${u}`);
       break;
+    }
   }
 });
 
@@ -100,6 +111,7 @@ const probe = await send("Runtime.evaluate", {
       loadingText: text("loading"),
       status: text("status-text"),
       dataNote: text("data-note"),
+      searchNote: text("search-note"),
       categoryRows: document.querySelectorAll("#categories .cat-row").length,
       subLabels: document.querySelectorAll("#categories .subs label").length,
       canvasSize: canvas ? [canvas.width, canvas.height] : null,
@@ -122,6 +134,7 @@ const report = {
   consoleErrors,
   exceptions,
   failedRequests: failedRequests.slice(0, 20),
+  aborted: { count: abortedRequests.length, sample: abortedRequests.slice(0, 5) },
 };
 console.log(JSON.stringify(report, null, 2));
 socket.close();

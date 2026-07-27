@@ -10,9 +10,28 @@
 // The method is the standard one: walk candidates in importance order, keep a
 // label if its box does not touch a box already kept, and stop at the budget.
 // An occupancy grid makes the overlap test O(1) per label.
+//
+// Crowding
+// --------
+// The hard case is several important things at one point - a cathedral, the
+// square it stands on and the city named after it all share a coordinate, and
+// straight collision testing shows one and silently drops the rest. Three ways
+// out, and the map offers all three because they suit different questions:
+//
+//   * spread      try the label above, below and beside its anchor before
+//                 giving up, and draw a leader line when it ends up displaced.
+//                 The default: it costs nothing and recovers most of them.
+//   * ignore      draw every label the budget allows, overlapping or not.
+//                 Illegible in a city centre, but it is the only way to see
+//                 that eleven things are stacked on one dot.
+//   * max importance (in main.js) hide the loudest items so the next tier is
+//                 not competing with them at all.
 
 const CELL = 20; // px; smaller than a label, so a box covers several cells
 const MARGIN = 140; // px of off-screen slack, so labels do not pop at the edge
+
+// Beyond this a label reads as belonging to nothing, so it is better to drop it.
+const MAX_DISPLACEMENT = 3;
 
 // Text width depends on the string, and measuring is far too slow to redo per
 // frame - but titles repeat across every render, so measure once and keep it.
@@ -34,10 +53,40 @@ function emWidth(text) {
   return width;
 }
 
+/** Where to try putting a label, in order. Straight up and down first: a
+ *  stack of names over one dot still reads as a list, where a scatter of
+ *  diagonals does not. */
+function* placements(halfW, halfH, spread) {
+  yield [0, 0];
+  if (!spread) return;
+  const stepY = 2 * halfH + 3;
+  const stepX = halfW + 6;
+  for (let ring = 1; ring <= MAX_DISPLACEMENT; ring++) {
+    yield [0, -ring * stepY];
+    yield [0, ring * stepY];
+    yield [stepX, -ring * stepY];
+    yield [-stepX, -ring * stepY];
+    yield [stepX, ring * stepY];
+    yield [-stepX, ring * stepY];
+  }
+}
+
 /**
- * @returns the items that should get a label, most important first.
+ * @returns placements, most important first:
+ *          {item, position, offset} where `position` is where the text goes
+ *          (the item's own coordinate unless it had to be displaced) and
+ *          `offset` is how far in pixels it moved, for the leader line.
  */
-export function selectLabels({ items, viewport, importance, sizeOf, budget, avoid = [] }) {
+export function selectLabels({
+  items,
+  viewport,
+  importance,
+  sizeOf,
+  budget,
+  avoid = [],
+  spread = true,
+  ignoreCollisions = false,
+}) {
   const occupied = new Set();
   const kept = [];
   const width = viewport.width;
@@ -45,12 +94,15 @@ export function selectLabels({ items, viewport, importance, sizeOf, budget, avoi
   const cellKey = (cx, cy) => (cx + 4096) * 32768 + (cy + 4096);
 
   // Block out the panels first, so no label is drawn where it cannot be read.
-  for (const rect of avoid) {
-    const cx1 = Math.floor(rect.x1 / CELL);
-    const cy1 = Math.floor(rect.y1 / CELL);
-    for (let cy = Math.floor(rect.y0 / CELL); cy <= cy1; cy++) {
-      for (let cx = Math.floor(rect.x0 / CELL); cx <= cx1; cx++) {
-        occupied.add(cellKey(cx, cy));
+  // Skipped when collisions are ignored, since nothing is being avoided then.
+  if (!ignoreCollisions) {
+    for (const rect of avoid) {
+      const cx1 = Math.floor(rect.x1 / CELL);
+      const cy1 = Math.floor(rect.y1 / CELL);
+      for (let cy = Math.floor(rect.y0 / CELL); cy <= cy1; cy++) {
+        for (let cx = Math.floor(rect.x0 / CELL); cx <= cx1; cx++) {
+          occupied.add(cellKey(cx, cy));
+        }
       }
     }
   }
@@ -66,32 +118,52 @@ export function selectLabels({ items, viewport, importance, sizeOf, budget, avoi
     if (x < -MARGIN || y < -MARGIN || x > width + MARGIN || y > height + MARGIN) {
       continue;
     }
+    if (ignoreCollisions) {
+      kept.push({ item, position: item.position, offset: 0 });
+      continue;
+    }
+
     const size = sizeOf(item);
     const halfW = (emWidth(item.title) * size) / 2 + 3;
     const halfH = size / 2 + 2;
 
-    const cx0 = Math.floor((x - halfW) / CELL);
-    const cx1 = Math.floor((x + halfW) / CELL);
-    const cy0 = Math.floor((y - halfH) / CELL);
-    const cy1 = Math.floor((y + halfH) / CELL);
+    let placed = null;
+    for (const [dx, dy] of placements(halfW, halfH, spread)) {
+      const cx0 = Math.floor((x + dx - halfW) / CELL);
+      const cx1 = Math.floor((x + dx + halfW) / CELL);
+      const cy0 = Math.floor((y + dy - halfH) / CELL);
+      const cy1 = Math.floor((y + dy + halfH) / CELL);
 
-    let blocked = false;
-    for (let cy = cy0; cy <= cy1 && !blocked; cy++) {
-      for (let cx = cx0; cx <= cx1; cx++) {
-        if (occupied.has(cellKey(cx, cy))) {
-          blocked = true;
-          break;
+      let blocked = false;
+      for (let cy = cy0; cy <= cy1 && !blocked; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          if (occupied.has(cellKey(cx, cy))) {
+            blocked = true;
+            break;
+          }
         }
       }
-    }
-    if (blocked) continue;
+      if (blocked) continue;
 
-    for (let cy = cy0; cy <= cy1; cy++) {
-      for (let cx = cx0; cx <= cx1; cx++) {
-        occupied.add(cellKey(cx, cy));
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) occupied.add(cellKey(cx, cy));
       }
+      placed = [dx, dy];
+      break;
     }
-    kept.push(item);
+    if (!placed) continue;
+
+    const [dx, dy] = placed;
+    const offset = Math.hypot(dx, dy);
+    kept.push({
+      item,
+      // Unprojected rather than kept as a pixel offset, so the leader line has
+      // a real end point and the text layer needs no special handling. Both
+      // drift together while zooming and are recomputed when the view settles,
+      // which is already how the selection itself works.
+      position: offset ? viewport.unproject([x + dx, y + dy]) : item.position,
+      offset,
+    });
   }
   return kept;
 }

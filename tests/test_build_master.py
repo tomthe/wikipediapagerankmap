@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 # qid 2 München: native label + dewiki title, no enwiki article
 # qid 3 a nameless thing with no rank at all
 # qid 4 a castle that is also a building - priority must pick castle
+# qid 5 a river in two countries - the country must not be guessed at
 COORDS = [
     (1, -0.1276, 51.5072),
     (1, -0.1280, 51.5080),
@@ -31,6 +32,7 @@ COORDS = [
     (2, 11.5820, 48.1351),
     (3, 100.0, 13.0),
     (4, 8.0, 47.0),
+    (5, 12.0, 48.0),
 ]
 CLAIMS_ITEM = [
     (1, 31, 5119), (1, 31, 515), (1, 17, 145),   # capital, city, country=UK
@@ -38,9 +40,10 @@ CLAIMS_ITEM = [
     (3, 31, 99999999),                           # unmapped class
     (4, 31, 23413), (4, 31, 41176),              # castle + building
     (23413, 279, 41176),                         # castle subclass of building
+    (5, 17, 183), (5, 17, 145),                  # two countries, no single answer
 ]
 LABELS = [
-    (1, "London"), (2, "Munich"), (4, "Neuschwanstein"),
+    (1, "London"), (2, "Munich"), (4, "Neuschwanstein"), (5, "Danube"),
     (145, "United Kingdom"), (183, "Germany"),
     (515, "city"), (5119, "capital"), (23413, "castle"), (41176, "building"),
 ]
@@ -149,7 +152,7 @@ def main() -> None:
             if not ok:
                 failures.append(name)
 
-        check("one row per item", len(df) == 4, f"got {len(df)}")
+        check("one row per item", len(df) == 5, f"got {len(df)}")
 
         london = rows[1]
         check("multi-coordinate item keeps a real value",
@@ -160,6 +163,8 @@ def main() -> None:
         check("english title from enwiki", london["title_en"] == "London")
         check("country label resolved", london["country_label"] == "United Kingdom",
               str(london["country_label"]))
+        check("single country counted as one", london["n_countries"] == 1,
+              str(london["n_countries"]))
         check("commonswiki excluded from sitelink count", london["n_sitelinks"] == 3,
               str(london["n_sitelinks"]))
         check("capital beats city on priority", london["sub"] == 1,
@@ -186,6 +191,12 @@ def main() -> None:
         check("castle beats building on priority",
               castle["cat"] == 5 and castle["sub"] > 0,
               f"cat={castle['cat']} sub={castle['sub']}")
+
+        # build_tiles blanks the name when this is above 1, because P17 has no
+        # single answer for a river and an arbitrary pick reads as a fact.
+        river = rows[5]
+        check("several countries are counted, not collapsed",
+              river["n_countries"] == 2, str(river["n_countries"]))
 
         check("top item scores highest",
               london["score"] == max(r["score"] for r in rows.values()),

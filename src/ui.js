@@ -1,9 +1,15 @@
 // Hover tooltip and the click-through detail panel.
 //
-// Tiles deliberately carry only what the map needs to draw (name, category,
-// two importance numbers). Everything richer - the summary text and the
-// thumbnail - is fetched from Wikipedia on demand for the one item that was
-// clicked, so no byte of it is paid for while panning.
+// The tiles now carry a description, country, admin area, population,
+// elevation, founding year and language-edition count alongside the name, so
+// the hover can answer "what is this" without a network round trip. Adding
+// descr_en cost about 20% on the tile pyramid and it is the single line that
+// most often makes a label make sense.
+//
+// The one thing still fetched on demand is the Wikipedia summary and its
+// thumbnail, for the one item that was clicked - a paragraph of prose and a
+// picture per item would be several gigabytes in the tiles, and nobody reads
+// more than a handful per session.
 
 const wikiHost = (lang) => `https://${lang || "en"}.wikipedia.org`;
 const articleUrl = (lang, title) =>
@@ -13,6 +19,39 @@ const summaryUrl = (lang, title) =>
     title.replace(/ /g, "_")
   )}`;
 
+const nf = new Intl.NumberFormat();
+
+/** Wikidata has populations claimed to the person for cities of ten million,
+ *  which is false precision; round the big ones and print the small ones. */
+export function formatPopulation(value) {
+  if (value == null) return null;
+  if (value >= 1e6) return `${(value / 1e6).toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  })} million`;
+  return nf.format(value);
+}
+
+export function formatYear(year) {
+  if (year == null) return null;
+  return year < 0 ? `${nf.format(-year)} BC` : String(year);
+}
+
+/** Country and admin area, without repeating a city-state's own name. */
+export function formatPlace(item) {
+  const parts = [];
+  if (item.admin && item.admin !== item.title) parts.push(item.admin);
+  if (item.country && item.country !== item.title && item.country !== item.admin) {
+    parts.push(item.country);
+  }
+  return parts.join(", ");
+}
+
+function kindOf(categories, item) {
+  const cat = categories.categories[item.cat];
+  const sub = cat?.subcategories?.[item.sub];
+  return sub && sub !== "Other" ? `${sub} · ${cat.name}` : cat?.name ?? "";
+}
+
 export class Tooltip {
   constructor(element, { categories }) {
     this.el = element;
@@ -21,23 +60,47 @@ export class Tooltip {
 
   show(item, x, y) {
     if (!item) return this.hide();
-    const cat = this.categories.categories[item.cat];
-    const sub = cat?.subcategories?.[item.sub];
-    const kind = sub && sub !== "Other" ? `${sub} · ${cat.name}` : cat?.name ?? "";
-    this.el.innerHTML = "";
+    this.el.textContent = "";
+
     const name = document.createElement("div");
     name.className = "t-name";
-    name.textContent = item.title;
-    const meta = document.createElement("div");
-    meta.className = "t-meta";
-    meta.textContent =
-      `${kind} · importance ${(item.score * 100).toFixed(0)}` +
-      (item.wiki
-        ? item.wikiLang === "en"
-          ? ""
-          : ` · ${item.wikiLang}.wikipedia`
-        : " · no article");
-    this.el.append(name, meta);
+    name.textContent = item.title + (item.hasImage ? " 📷" : "");
+
+    const kind = document.createElement("div");
+    kind.className = "t-meta";
+    kind.textContent = kindOf(this.categories, item);
+    this.el.append(name, kind);
+
+    if (item.descr) {
+      const descr = document.createElement("div");
+      descr.className = "t-descr";
+      descr.textContent = item.descr;
+      this.el.append(descr);
+    }
+
+    // Facts worth reading at a glance, and only the ones this item has.
+    const facts = [
+      formatPlace(item),
+      item.pop != null ? `pop. ${formatPopulation(item.pop)}` : null,
+      item.elev != null ? `${nf.format(item.elev)} m` : null,
+      formatYear(item.year),
+    ].filter(Boolean);
+    if (facts.length) {
+      const line = document.createElement("div");
+      line.className = "t-meta";
+      line.textContent = facts.join(" · ");
+      this.el.append(line);
+    }
+
+    const rank = document.createElement("div");
+    rank.className = "t-rank";
+    rank.textContent =
+      `importance ${(item.score * 100).toFixed(0)} · ` +
+      `links ${(item.pr * 100).toFixed(0)} · views ${(item.qr * 100).toFixed(0)}` +
+      (item.sitelinks ? ` · ${item.sitelinks} languages` : "") +
+      (item.wiki ? "" : " · no article");
+    this.el.append(rank);
+
     this.el.style.display = "block";
     // Keep the tooltip on screen near the right and bottom edges.
     const box = this.el.getBoundingClientRect();
@@ -72,10 +135,7 @@ export class DetailPanel {
     this.controller = new AbortController();
     const { signal } = this.controller;
 
-    const cat = this.categories.categories[item.cat];
-    const sub = cat?.subcategories?.[item.sub];
     const [lon, lat] = item.position;
-
     this.body.textContent = "";
 
     const title = document.createElement("h2");
@@ -83,7 +143,7 @@ export class DetailPanel {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = [sub && sub !== "Other" ? sub : null, cat?.name]
+    meta.textContent = [kindOf(this.categories, item), formatPlace(item)]
       .filter(Boolean)
       .join(" · ");
 
@@ -91,18 +151,30 @@ export class DetailPanel {
     figure.alt = "";
     figure.hidden = true;
 
+    // The tile's own one-line description shows immediately; the Wikipedia
+    // summary replaces it when it lands, and it stays if that request fails.
     const extract = document.createElement("p");
     extract.className = "extract";
-    extract.textContent = item.wiki ? "Loading summary…" : "";
+    extract.textContent = item.descr || (item.wiki ? "Loading summary…" : "");
 
     const facts = document.createElement("dl");
     const addFact = (key, value) => {
+      if (value === null || value === undefined || value === "") return;
       const dt = document.createElement("dt");
       dt.textContent = key;
       const dd = document.createElement("dd");
       dd.textContent = value;
       facts.append(dt, dd);
     };
+    addFact("Population", formatPopulation(item.pop));
+    addFact("Elevation", item.elev != null ? `${nf.format(item.elev)} m` : null);
+    addFact("Founded", formatYear(item.year));
+    addFact("Country", item.country);
+    addFact("Admin area", item.admin);
+    addFact(
+      "Language editions",
+      item.sitelinks ? (item.sitelinks >= 255 ? "255+" : String(item.sitelinks)) : null
+    );
     addFact("Importance", `${(item.score * 100).toFixed(1)} / 100`);
     addFact("PageRank", `${(item.pr * 100).toFixed(1)} / 100`);
     addFact("Pageviews", `${(item.qr * 100).toFixed(1)} / 100`);
@@ -137,20 +209,16 @@ export class DetailPanel {
     fetch(summaryUrl(item.wikiLang, item.wiki), { signal })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (!data) {
-          extract.textContent = "";
-          return;
-        }
-        extract.textContent = data.extract ?? "";
-        if (data.description) meta.textContent += ` · ${data.description}`;
+        if (!data) return;
+        if (data.extract) extract.textContent = data.extract;
         const thumb = data.thumbnail?.source;
         if (thumb) {
           figure.src = thumb;
           figure.hidden = false;
         }
       })
-      .catch((err) => {
-        if (err.name !== "AbortError") extract.textContent = "";
+      .catch(() => {
+        /* the tile's description is already on screen */
       });
   }
 }

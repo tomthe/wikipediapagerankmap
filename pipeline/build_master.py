@@ -89,12 +89,19 @@ def main() -> None:
         WHERE c.pid = 31 GROUP BY c.qid
         """
     )
+    # An item can be in several countries - the Danube is in ten, a language in
+    # dozens - and picking one of them is not a summary, it is a wrong answer.
+    # (P17 of "French" happens to come out as Guernsey.) So count them too, and
+    # let the consumer decide: build_tiles drops the name when it is ambiguous
+    # rather than putting a arbitrary country in a tooltip.
     con.execute(
         """
         CREATE TABLE single_item_claims AS
         SELECT qid,
                max(CASE WHEN pid = 17  THEN value END) AS country_qid,
-               max(CASE WHEN pid = 131 THEN value END) AS admin_qid
+               max(CASE WHEN pid = 131 THEN value END) AS admin_qid,
+               count(DISTINCT CASE WHEN pid = 17  THEN value END) AS n_countries,
+               count(DISTINCT CASE WHEN pid = 131 THEN value END) AS n_admin
         FROM claims_item WHERE pid IN (17, 131) AND qid IN (SELECT qid FROM geo)
         GROUP BY qid
         """
@@ -271,6 +278,8 @@ def main() -> None:
                 e.population, e.elevation, e.inception, e.image, e.website,
                 coalesce(s.n_sitelinks, 0) AS n_sitelinks,
                 sic.country_qid, sic.admin_qid,
+                coalesce(sic.n_countries, 0) AS n_countries,
+                coalesce(sic.n_admin, 0) AS n_admin,
                 io.classes AS instance_of,
                 coalesce(cats.cat, 0) AS cat,
                 coalesce(cats.sub, 0) AS sub,

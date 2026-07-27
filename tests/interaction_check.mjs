@@ -19,13 +19,26 @@ const problems = [];
 function send(method, params = {}) {
   const id = nextId++;
   socket.send(JSON.stringify({ id, method, params }));
-  return new Promise((resolve) => waiting.set(id, resolve));
+  return new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
 }
 socket.addEventListener("message", (e) => {
   const msg = JSON.parse(e.data);
   if (msg.id && waiting.has(msg.id)) {
-    waiting.get(msg.id)(msg.result);
+    const { resolve, reject } = waiting.get(msg.id);
     waiting.delete(msg.id);
+    // A CDP error reply carries no `result`. Resolving undefined here turns the
+    // real cause into "cannot read properties of undefined" three lines later.
+    if (msg.error) reject(new Error(`${msg.error.message} (${msg.error.code})`));
+    else resolve(msg.result);
+  } else if (msg.method === "Inspector.targetCrashed") {
+    console.log("   EVENT renderer crashed");
+    problems.push("the renderer crashed");
+  } else if (msg.method === "Page.frameNavigated" && !msg.params.frame.parentId) {
+    // A mid-test navigation destroys the JS context and every later step fails
+    // with something unhelpful, so say plainly that it happened.
+    console.log(`   EVENT navigated to ${msg.params.frame.url}`);
+  } else if (msg.method === "Runtime.executionContextsCleared") {
+    console.log("   EVENT execution contexts cleared");
   } else if (msg.method === "Runtime.exceptionThrown") {
     problems.push(
       "exception: " +
@@ -40,16 +53,33 @@ await send("Network.enable");
 await send("Network.setCacheDisabled", { cacheDisabled: true });
 await send("Page.enable");
 
-const evaluate = async (expression) => {
+const evaluateOnce = async (expression) => {
   const res = await send("Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
   });
+  if (!res) throw new Error("no reply from the page (did it crash or navigate?)");
   if (res.exceptionDetails) {
     throw new Error(res.exceptionDetails.exception?.description ?? "eval failed");
   }
   return res.result?.value;
+};
+
+// A destroyed context means the page went away underneath us - a reload, a
+// crash, or another debugger client driving the same tab. Retrying once in the
+// new context turns that from "the rest of the suite never ran" into one noisy
+// step, and the EVENT lines above say which it was.
+const evaluate = async (expression) => {
+  try {
+    return await evaluateOnce(expression);
+  } catch (err) {
+    if (!/Execution context was destroyed/i.test(err.message)) throw err;
+    console.log("   EVENT execution context went away; retrying once");
+    problems.push("the page context was destroyed mid-run");
+    await new Promise((r) => setTimeout(r, 8000));
+    return await evaluateOnce(expression);
+  }
 };
 
 const step = (name, ok, detail = "") => {
@@ -85,9 +115,15 @@ const defaults = await evaluate(`(() => {
   };
 })()`);
 step(
+  // The `total` guard matters: on a slow load the panel may not have rendered
+  // yet, and without it an empty panel reads as "the defaults are wrong".
   "some categories start switched off",
-  defaults.off.length > 0 && defaults.off.length < defaults.total,
-  `${defaults.total} categories, off: ${JSON.stringify(defaults.off)}`
+  defaults.total > 0 &&
+    defaults.off.length > 0 &&
+    defaults.off.length < defaults.total,
+  defaults.total === 0
+    ? "the category panel had not rendered yet"
+    : `${defaults.total} categories, off: ${JSON.stringify(defaults.off)}`
 );
 
 // --- 2. unchecking a category removes its items -----------------------------
@@ -176,26 +212,47 @@ const panel = await evaluate(`(async () => {
   p.open({
     qid: 1794, title: "Frankfurt", wiki: "Frankfurt", wikiLang: "en",
     position: [8.6821, 50.1109], score: 0.8, pr: 0.8, qr: 0.8, cat: 1, sub: 2,
-    hasImage: true,
+    hasImage: true, descr: "city in Hesse, Germany", pop: 764104, elev: 112,
+    year: 794, sitelinks: 199, country: "Germany", admin: "Darmstadt Government Region",
   });
   await ${sleep(4000)};
   const body = document.getElementById("detail-body");
   const links = [...body.querySelectorAll(".links a")].map(a => a.textContent);
+  const dts = [...body.querySelectorAll("dt")].map(d => d.textContent);
+  const dds = [...body.querySelectorAll("dd")].map(d => d.textContent);
   return {
     open: document.getElementById("detail").classList.contains("open"),
     heading: body.querySelector("h2")?.textContent,
+    meta: body.querySelector(".meta")?.textContent,
     extractLength: (body.querySelector(".extract")?.textContent ?? "").length,
     hasImage: !!body.querySelector("img:not([hidden])"),
+    facts: Object.fromEntries(dts.map((k, i) => [k, dds[i]])),
     links,
   };
 })()`);
-step("detail panel opens", panel.open && panel.heading === "Frankfurt", JSON.stringify(panel));
+step("detail panel opens", panel.open && panel.heading === "Frankfurt", JSON.stringify(panel.heading));
 step("wikipedia summary loads", panel.extractLength > 80, `${panel.extractLength} chars`);
 step("thumbnail loads", panel.hasImage, "no img");
 step(
   "all four links present",
   panel.links.length === 4 && panel.links[0].startsWith("Wikipedia"),
   JSON.stringify(panel.links)
+);
+// The new tile columns have to survive all the way to the panel, or paying
+// 20% on the pyramid for descr_en bought nothing.
+step(
+  "the new tile fields reach the panel",
+  panel.facts.Population === "764,104" &&
+    panel.facts.Elevation === "112 m" &&
+    panel.facts.Founded === "794" &&
+    panel.facts.Country === "Germany" &&
+    panel.facts["Language editions"] === "199",
+  JSON.stringify(panel.facts)
+);
+step(
+  "admin area and country appear in the subtitle",
+  (panel.meta ?? "").includes("Darmstadt") && (panel.meta ?? "").includes("Germany"),
+  panel.meta
 );
 
 // --- 6. the density slider caps the label count -----------------------------
@@ -232,7 +289,95 @@ step(
   `budget 50 -> ${slider.low} labels; budget 800 -> ${slider.high}`
 );
 
-// --- 7. all / none ----------------------------------------------------------
+// --- 7. the three answers to crowding ---------------------------------------
+// All measured from the same dense view the density step just set up.
+const counts = `(() => {
+  const s = document.getElementById("status-text").textContent;
+  const m = /^([\\d,]+) labels of ([\\d,]+) places/.exec(s);
+  const n = (v) => Number(v.replace(/,/g, ""));
+  const moved = /([\\d,]+) moved aside/.exec(s);
+  return { labels: n(m[1]), places: n(m[2]), moved: moved ? n(moved[1]) : 0 };
+})()`;
+
+const ceiling = await evaluate(`(async () => {
+  const el = document.getElementById("maxscore");
+  const before = ${counts};
+  el.value = "60";                       // squared: importance <= 0.36
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  await ${sleep(1500)};
+  const after = ${counts};
+  const label = document.getElementById("maxscore-out").textContent;
+  el.value = "100";
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  await ${sleep(1500)};
+  return { before, after, label, restored: ${counts} };
+})()`);
+// ">=" on the way back, not "==": a tile can land between the two readings.
+step(
+  "maximum importance hides the loudest places",
+  ceiling.after.places < ceiling.before.places &&
+    ceiling.restored.places >= ceiling.before.places,
+  `${ceiling.before.places} -> ${ceiling.after.places} (${ceiling.label}) -> ${ceiling.restored.places}`
+);
+
+const spread = await evaluate(`(async () => {
+  const box = document.getElementById("spread");
+  const on = ${counts};
+  box.click();                            // off
+  await ${sleep(1500)};
+  const off = ${counts};
+  box.click();                            // back on
+  await ${sleep(1500)};
+  return { on, off };
+})()`);
+step(
+  "moving crowded labels aside fits more of them in",
+  spread.on.labels > spread.off.labels && spread.on.moved > 0,
+  `spread on: ${spread.on.labels} labels (${spread.on.moved} moved); off: ${spread.off.labels}`
+);
+
+const overlap = await evaluate(`(async () => {
+  const budget = Number(document.getElementById("labelbudget").value);
+  const box = document.getElementById("show-all");
+  const before = ${counts};
+  box.click();
+  await ${sleep(1500)};
+  const after = ${counts};
+  const spreadDisabled = document.getElementById("spread").disabled;
+  box.click();
+  await ${sleep(1500)};
+  return { budget, before, after, spreadDisabled };
+})()`);
+// Not "== budget": the budget counts labels that fit on screen, and `places`
+// includes everything in the padded bounds, so the two need not meet.
+step(
+  "show-all draws more labels, up to the budget",
+  overlap.after.labels > overlap.before.labels &&
+    overlap.after.labels <= overlap.budget,
+  `${overlap.before.labels} -> ${overlap.after.labels} of budget ${overlap.budget}`
+);
+step("show-all disables the spread option", overlap.spreadDisabled, "still enabled");
+
+const bypop = await evaluate(`(async () => {
+  const el = document.getElementById("population");
+  const before = ${counts};
+  el.value = "100";
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  await ${sleep(1500)};
+  const after = ${counts};
+  const out = document.getElementById("population-out").textContent;
+  el.value = "0";
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  await ${sleep(1500)};
+  return { before, after, out };
+})()`);
+step(
+  "sizing by population changes which labels are drawn",
+  bypop.out === "100%" && bypop.after.labels !== bypop.before.labels,
+  `${bypop.before.labels} -> ${bypop.after.labels} labels at ${bypop.out}`
+);
+
+// --- 8. all / none ----------------------------------------------------------
 const allNone = await evaluate(`(async () => {
   const boxes = () => [...document.querySelectorAll('#categories input[data-cat]')]
     .filter(b => b.dataset.sub === undefined);

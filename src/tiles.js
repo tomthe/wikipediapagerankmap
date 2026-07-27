@@ -13,12 +13,21 @@
 // Because the pyramid puts every item in exactly one tile, drawing zoom Z means
 // unioning tiles for z = 0..Z: parents stay cached while panning, and nothing
 // is ever drawn twice.
+//
+// Tiles come out of a packed file by byte range rather than one file each. Two
+// things follow from that. Neighbouring tiles are adjacent in the pack, so a
+// column of them is fetched in one request instead of eight. And the per-zoom
+// index is itself a range in the pack, so it is fetched when a zoom is first
+// visited rather than all thirteen at startup - which is most of what used to
+// stand between opening the page and seeing a map.
 
-import { fetchTile, fetchTileIndex } from "./decode.js";
+import { decodeTile, decodeZoomIndex, maybeGunzip } from "./decode.js";
+import { coalesce } from "./pack.js";
 
-const MAX_CONCURRENT = 10;
+const MAX_CONCURRENT = 8;        // parallel range requests
 const MAX_CACHED_TILES = 1200;
-const BOUNDS_PADDING = 0.1; // fraction of the viewport, so panning has a head start
+const MAX_CACHED_BYTES = 96e6;   // decoded; deep tiles are far bigger than the mean
+const BOUNDS_PADDING = 0.1;      // fraction of the viewport, so panning has a head start
 
 export function lonToTileX(lon, z) {
   return Math.floor(((lon + 180) / 360) * (1 << z));
@@ -33,51 +42,55 @@ export function latToTileY(lat, z) {
 }
 
 export class TileManager {
-  constructor({ baseUrl, manifest, onUpdate }) {
-    this.baseUrl = baseUrl;
+  constructor({ pack, manifest, onUpdate }) {
+    this.pack = pack;
     this.maxZoom = manifest.maxZoom;
+    this.countries = manifest.countries ?? [];
+    this.zoomMeta = manifest.zooms ?? {};
     this.onUpdate = onUpdate;
-    // Which zooms the build actually produced, so a zoom with no tiles is
-    // distinguishable from a zoom whose index failed to download.
-    this.populatedZooms = new Set(
-      Object.keys(manifest.zooms ?? {}).map((z) => Number(z))
-    );
     this.cache = new Map();      // "z/x/y" -> {items, bytes, used}
-    this.pending = new Map();    // "z/x/y" -> {controller}
-    this.indexes = new Map();    // z -> Set of packed (x<<16|y)
+    this.indexes = new Map();    // z -> {keys, lengths, offsets, byKey}
+    this.indexPending = new Map();
+    this.runs = new Map();       // run id -> {controller, keys}
     this.needed = [];            // ordered list of keys currently in view
     this.queue = [];
     this.clock = 0;
-    this.loadedBytes = 0;
-    this.requests = 0;
+    this.runId = 0;
+    this.cachedBytes = 0;
   }
 
-  /** Indexes are tiny and there are only a dozen; fetching them up front makes
-   *  every later existence check synchronous. */
-  async loadIndexes() {
-    const zooms = [];
-    for (let z = 0; z <= this.maxZoom; z++) zooms.push(z);
-    await Promise.all(
-      zooms.map(async (z) => {
-        const set = await fetchTileIndex(`${this.baseUrl}/tiles/${z}/index.bin.gz`).catch(
-          () => null
-        );
-        if (set) this.indexes.set(z, set);
+  // ----------------------------------------------------------------- indexes
+
+  /** The directory for one zoom, fetched the first time that zoom is drawn. */
+  ensureIndex(z) {
+    if (this.indexes.has(z) || this.indexPending.has(z)) return;
+    const meta = this.zoomMeta[String(z)];
+    if (!meta) {
+      this.indexes.set(z, null); // the build produced nothing at this zoom
+      return;
+    }
+    const [offset, length] = meta.index;
+    const promise = this.pack
+      .read(offset, length)
+      .then(maybeGunzip)
+      .then((buffer) => {
+        this.indexes.set(z, decodeZoomIndex(buffer, meta.base));
+        this.indexPending.delete(z);
+        // The view that asked for this index was told the zoom had no tiles,
+        // so redrawing is not enough - the whole reconciliation has to run
+        // again now that they can be found.
+        this.refresh();
       })
-    );
-  }
-
-  exists(z, x, y) {
-    const index = this.indexes.get(z);
-    if (index) return index.has(((x << 16) | y) >>> 0);
-    // No index in hand: if the build says this zoom has tiles, try anyway and
-    // let the 404 handling sort it out. Better a few wasted requests than a
-    // blank map because one small file did not download.
-    return this.populatedZooms.has(z);
+      .catch((err) => {
+        console.warn(`zoom ${z} index failed`, err);
+        this.indexPending.delete(z);
+      });
+    this.indexPending.set(z, promise);
   }
 
   /** Every tile covering the viewport, from the world tile down to the current
-   *  zoom, nearest-to-centre first. */
+   *  zoom, nearest-to-centre first. Zooms whose index has not arrived are
+   *  skipped and requested; their tiles appear on the next update. */
   tilesForView(bounds, zoom) {
     const [minX, minY, maxX, maxY] = bounds;
     const padX = (maxX - minX) * BOUNDS_PADDING;
@@ -89,6 +102,11 @@ export class TileManager {
     const zMax = Math.min(Math.max(Math.floor(zoom), 0), this.maxZoom);
     const wanted = [];
     for (let z = 0; z <= zMax; z++) {
+      const index = this.indexes.get(z);
+      if (!index) {
+        this.ensureIndex(z);
+        continue;
+      }
       const n = 1 << z;
       const yTop = latToTileY(north, z);
       const yBottom = latToTileY(south, z);
@@ -99,10 +117,13 @@ export class TileManager {
       for (let x = xLeft; x <= xRight; x++) {
         const wrapped = ((x % n) + n) % n; // antimeridian
         for (let y = yTop; y <= yBottom; y++) {
-          if (!this.exists(z, wrapped, y)) continue;
+          const slot = index.byKey.get((((wrapped << 16) | y) >>> 0));
+          if (slot === undefined) continue;
           wanted.push({
-            z, x: wrapped, y,
+            z, x: wrapped, y, slot,
             key: `${z}/${wrapped}/${y}`,
+            offset: index.offsets[slot],
+            length: index.lengths[slot],
             dist: Math.abs(x - cx) + Math.abs(y - cy),
           });
         }
@@ -111,70 +132,112 @@ export class TileManager {
     return wanted;
   }
 
-  /** Reconcile the in-flight/queued work with what the current view needs. */
+  /** Redo the last update, for when something other than the view changed. */
+  refresh() {
+    if (this.lastView) this.update(this.lastView.bounds, this.lastView.zoom);
+    this.onUpdate?.();
+  }
+
+  /** Reconcile the in-flight work with what the current view needs. */
   update(bounds, zoom) {
+    this.lastView = { bounds, zoom };
     const wanted = this.tilesForView(bounds, zoom);
     const wantedKeys = new Set(wanted.map((t) => t.key));
     this.needed = wanted.map((t) => t.key);
 
-    for (const [key, entry] of this.pending) {
-      if (!wantedKeys.has(key)) {
-        entry.controller.abort();
-        this.pending.delete(key);
+    for (const [id, run] of this.runs) {
+      if (!run.keys.some((key) => wantedKeys.has(key))) {
+        run.controller.abort();
+        this.runs.delete(id);
       }
     }
+    const inFlight = new Set();
+    for (const run of this.runs.values()) for (const key of run.keys) inFlight.add(key);
 
     // Shallow tiles first: they carry the important labels and cover the most
     // ground, so the map fills in from the top down.
-    this.queue = wanted
-      .filter((t) => !this.cache.has(t.key) && !this.pending.has(t.key))
+    const missing = wanted
+      .filter((t) => !this.cache.has(t.key) && !inFlight.has(t.key))
       .sort((a, b) => a.z - b.z || a.dist - b.dist);
+
+    // Coalesce within a zoom only. Runs across zooms would span the gap where
+    // the previous zoom's index blob sits, and mixing them costs more than it
+    // saves because shallow zooms are wanted first anyway.
+    this.queue = [];
+    for (let z = 0; z <= this.maxZoom; z++) {
+      const atZoom = missing.filter((t) => t.z === z);
+      if (!atZoom.length) continue;
+      this.queue.push(
+        ...coalesce(atZoom, { partAt: (o) => this.pack.partAt(o) })
+      );
+    }
 
     this.pump();
     this.evict(wantedKeys);
   }
 
   pump() {
-    while (this.pending.size < MAX_CONCURRENT && this.queue.length) {
-      const tile = this.queue.shift();
+    while (this.runs.size < MAX_CONCURRENT && this.queue.length) {
+      const run = this.queue.shift();
+      const id = ++this.runId;
       const controller = new AbortController();
-      this.pending.set(tile.key, { controller });
-      this.requests += 1;
-      fetchTile(
-        `${this.baseUrl}/tiles/${tile.z}/${tile.x}/${tile.y}.bin.gz`,
-        controller.signal
-      )
-        .then((decoded) => {
-          this.pending.delete(tile.key);
-          this.cache.set(tile.key, {
-            items: decoded ? decoded.items : [],
-            bytes: decoded ? decoded.bytes : 0,
-            used: ++this.clock,
-          });
-          this.loadedBytes += decoded ? decoded.bytes : 0;
+      this.runs.set(id, { controller, keys: run.items.map((t) => t.key) });
+      this.pack
+        .read(run.start, run.length, controller.signal)
+        .then(async (buffer) => {
+          for (const tile of run.items) {
+            const from = tile.offset - run.start;
+            const slice = buffer.slice(from, from + tile.length);
+            let decoded = null;
+            try {
+              decoded = decodeTile(await maybeGunzip(slice), this.countries);
+            } catch (err) {
+              console.warn("tile failed to decode", tile.key, err);
+            }
+            this.store(tile.key, decoded);
+          }
+          this.runs.delete(id);
           this.pump();
           this.onUpdate?.();
         })
         .catch((err) => {
-          this.pending.delete(tile.key);
+          this.runs.delete(id);
           if (err.name !== "AbortError") {
-            console.warn("tile failed", tile.key, err);
-            this.cache.set(tile.key, { items: [], bytes: 0, used: ++this.clock });
+            console.warn("range failed", run.start, run.length, err);
+            // Remember the failure so a redraw does not hammer the same bytes.
+            for (const tile of run.items) this.store(tile.key, null);
           }
           this.pump();
         });
     }
   }
 
+  store(key, decoded) {
+    const bytes = decoded ? decoded.bytes : 0;
+    // Two runs should never carry the same tile, but the byte accounting is
+    // what drives eviction, so do not let a repeat inflate it.
+    this.cachedBytes -= this.cache.get(key)?.bytes ?? 0;
+    this.cache.set(key, {
+      items: decoded ? decoded.items : [],
+      bytes,
+      used: ++this.clock,
+    });
+    this.cachedBytes += bytes;
+  }
+
   evict(keep) {
-    if (this.cache.size <= MAX_CACHED_TILES) return;
+    if (this.cache.size <= MAX_CACHED_TILES && this.cachedBytes <= MAX_CACHED_BYTES) {
+      return;
+    }
     const victims = [...this.cache.entries()]
       .filter(([key]) => !keep.has(key))
       .sort((a, b) => a[1].used - b[1].used);
-    let excess = this.cache.size - MAX_CACHED_TILES;
-    for (const [key] of victims) {
-      if (excess-- <= 0) break;
+    for (const [key, tile] of victims) {
+      if (this.cache.size <= MAX_CACHED_TILES && this.cachedBytes <= MAX_CACHED_BYTES) {
+        break;
+      }
       this.cache.delete(key);
+      this.cachedBytes -= tile.bytes;
     }
   }
 
@@ -192,13 +255,16 @@ export class TileManager {
   }
 
   stats() {
+    let inFlight = 0;
+    for (const run of this.runs.values()) inFlight += run.keys.length;
+    const queued = this.queue.reduce((sum, run) => sum + run.items.length, 0);
     return {
       cached: this.cache.size,
-      pending: this.pending.size,
-      queued: this.queue.length,
+      pending: inFlight,
+      queued,
       needed: this.needed.length,
-      megabytes: this.loadedBytes / 1e6,
-      requests: this.requests,
+      megabytes: this.pack.bytes / 1e6,
+      requests: this.pack.requests,
     };
   }
 }

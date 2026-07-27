@@ -13,6 +13,8 @@ import { buildLayers, importanceOf, labelSize } from "./layers.js";
 import { selectLabels } from "./declutter.js";
 import { Search } from "./search.js";
 import { Tooltip, DetailPanel } from "./ui.js";
+import { Pack } from "./pack.js";
+import { basemapStyle } from "./basemap.js";
 
 const DATA_URL = "data";
 // Settlements and Administrative are the two categories the importance score
@@ -20,10 +22,6 @@ const DATA_URL = "data";
 // basemap says. Starting with them off makes the first view show the things
 // people came for, and both are one click away.
 const DEFAULT_OFF = ["Settlements", "Administrative"];
-const BASEMAPS = {
-  light: "https://basemaps.cartocdn.com/gl/positron-nolabels-gl-style/style.json",
-  dark: "https://basemaps.cartocdn.com/gl/dark-matter-nolabels-gl-style/style.json",
-};
 
 const $ = (id) => document.getElementById(id);
 
@@ -32,10 +30,16 @@ const state = {
   viewState: { longitude: 8, latitude: 47, zoom: 3.4, pitch: 0, bearing: 0 },
   style: {
     qrankWeight: 0.5,
-    labelScale: 1,
-    minImportance: 0,
+    populationWeight: 0,
+    labelScale: 1.3,
+    // Not a minimum. Lowering it hides the loudest items, which is the only
+    // way to read what is underneath them when several important things share
+    // a coordinate. 1 means everything.
+    maxImportance: 1,
     labelBudget: 300,
-    colorByCategory: false,
+    spread: true,
+    ignoreCollisions: false,
+    colorByCategory: true,
     palette: [],
   },
   hovered: null,
@@ -105,10 +109,11 @@ function chooseLabels(items) {
     items,
     viewport: currentViewport(),
     importance: (item) => importanceOf(item, state.style.qrankWeight),
-    sizeOf: (item) =>
-      labelSize(item, state.style.qrankWeight, state.style.labelScale),
+    sizeOf: (item) => labelSize(item, state.style),
     budget: state.style.labelBudget,
     avoid: panelRects(),
+    spread: state.style.spread,
+    ignoreCollisions: state.style.ignoreCollisions,
   });
 }
 
@@ -120,23 +125,33 @@ function scheduleLabels(items) {
   }, 130);
 }
 
-function render({ reselect = false } = {}) {
-  // The panel is live while the tile indexes are still downloading, so a click
-  // can land here before there is anything to draw into.
-  if (!deckgl) return;
+/** Everything in view that passes the category filter and the importance
+ *  ceiling. One list, used for the dots, the labels and the counts, so the
+ *  three can never disagree about what is on the map. */
+function visibleItems() {
+  const { qrankWeight, maxImportance } = state.style;
   const items = tiles.visibleItems().filter((item) => filter.accept(item));
+  if (maxImportance >= 1) return items;
+  return items.filter((item) => importanceOf(item, qrankWeight) <= maxImportance);
+}
+
+function render({ reselect = false } = {}) {
+  // The panel is live while the manifest is still downloading, so a click can
+  // land here before there is anything to draw into.
+  if (!deckgl) return;
+  const items = visibleItems();
   if (reselect) chooseLabels(items);
-  const { layers, visibleCount } = buildLayers({
+  const { layers, visibleCount, displacedCount } = buildLayers({
     items,
     labelled,
     style: state.style,
     theme: state.theme,
-    onHover: onHover,
-    onClick: onClick,
+    onHover,
+    onClick,
   });
   deckgl.setProps({ layers, viewState: state.viewState });
   filter.updateCounts(items);
-  updateStatus(visibleCount, labelled.length);
+  updateStatus(visibleCount, labelled.length, displacedCount);
   return items;
 }
 
@@ -148,39 +163,33 @@ function scheduleTiles() {
   });
 }
 
-function updateStatus(inView, labelCount) {
+function updateStatus(inView, labelCount, displaced) {
   const s = tiles.stats();
   const busy = s.pending + s.queued > 0;
   $("status").classList.toggle("busy", busy);
   $("status-text").textContent =
     `${labelCount.toLocaleString()} labels of ${inView.toLocaleString()} places · ` +
+    (displaced ? `${displaced} moved aside · ` : "") +
     `${s.needed} tiles in view · ${s.cached.toLocaleString()} cached · ` +
-    `${s.megabytes.toFixed(1)} MB loaded` +
+    `${s.megabytes.toFixed(1)} MB in ${s.requests.toLocaleString()} requests` +
     (busy ? ` · loading ${s.pending + s.queued}` : "");
 }
 
 // ------------------------------------------------------------------ callbacks
 
-function onViewStateChange({ viewState }) {
-  state.viewState = viewState;
-  const items = render();      // immediate, from cache
-  scheduleLabels(items ?? []); // re-declutter once the view settles
-  scheduleTiles();             // fetch what is missing, without blocking the draw
-  writeHash();
-}
+/** The label layer's rows are placements wrapping an item; the dot layer's are
+ *  items. Both should hover the same thing. */
+const itemOf = (object) => (object && object.item ? object.item : object) ?? null;
 
 function onHover(info) {
-  const item = info.object ?? null;
-  if (item !== state.hovered) {
-    state.hovered = item;
-    tooltip.show(item, info.x, info.y);
-  } else if (item) {
-    tooltip.show(item, info.x, info.y);
-  }
+  const item = itemOf(info.object);
+  state.hovered = item;
+  tooltip.show(item, info.x, info.y);
 }
 
 function onClick(info) {
-  if (info.object) detail.open(info.object);
+  const item = itemOf(info.object);
+  if (item) detail.open(item);
 }
 
 function flyTo(longitude, latitude, zoom) {
@@ -199,19 +208,19 @@ function flyTo(longitude, latitude, zoom) {
 
 // ---------------------------------------------------------------------- theme
 
-function applyTheme(theme) {
+async function applyTheme(theme) {
   state.theme = theme;
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("wikimap-theme", theme);
   state.style.palette = manifest.palette[theme];
   filter?.setPalette(state.style.palette);
+  render();
   // The scripting bundle has changed how it exposes the basemap between
   // versions; if none of these work the labels still retheme, only the tiles
   // underneath stay put.
   const map =
     deckgl?.getMapboxMap?.() ?? deckgl?.getMapLibreMap?.() ?? deckgl?._map ?? null;
-  if (map?.setStyle) map.setStyle(BASEMAPS[theme]);
-  render();
+  if (map?.setStyle) map.setStyle(await basemapStyle(theme));
 }
 
 // ----------------------------------------------------------------- controls
@@ -221,37 +230,56 @@ function wireControls() {
     applyTheme(state.theme === "dark" ? "light" : "dark")
   );
 
-  const weight = $("weight");
-  weight.addEventListener("input", () => {
-    const v = Number(weight.value) / 100;
+  const slider = (id, apply) => {
+    const el = $(id);
+    el.addEventListener("input", () => {
+      apply(Number(el.value));
+      render({ reselect: true });
+    });
+  };
+
+  slider("weight", (raw) => {
+    const v = raw / 100;
     state.style.qrankWeight = v;
     $("weight-out").textContent =
       v < 0.35 ? "link structure" : v > 0.65 ? "pageviews" : "balanced";
-    render({ reselect: true });
   });
 
-  const minscore = $("minscore");
-  minscore.addEventListener("input", () => {
-    // Squared so the low end of the slider, where almost everything lives, is
-    // where most of the travel goes.
-    const v = Math.pow(Number(minscore.value) / 100, 2);
-    state.style.minImportance = v;
-    $("minscore-out").textContent = v === 0 ? "all" : `≥ ${(v * 100).toFixed(1)}`;
-    render({ reselect: true });
+  slider("population", (raw) => {
+    const v = raw / 100;
+    state.style.populationWeight = v;
+    $("population-out").textContent = v === 0 ? "off" : `${(v * 100).toFixed(0)}%`;
   });
 
-  const labelbudget = $("labelbudget");
-  labelbudget.addEventListener("input", () => {
-    state.style.labelBudget = Number(labelbudget.value);
-    $("labelbudget-out").textContent = labelbudget.value;
-    render({ reselect: true });
+  slider("maxscore", (raw) => {
+    // Squared, so the top of the slider - where the handful of items that
+    // dominate a view actually live - gets most of the travel.
+    const v = Math.pow(raw / 100, 2);
+    state.style.maxImportance = raw >= 100 ? 1 : v;
+    $("maxscore-out").textContent =
+      raw >= 100 ? "all" : `≤ ${(v * 100).toFixed(1)}`;
   });
 
-  const labelscale = $("labelscale");
-  labelscale.addEventListener("input", () => {
-    const v = Number(labelscale.value) / 100;
+  slider("labelbudget", (raw) => {
+    state.style.labelBudget = raw;
+    $("labelbudget-out").textContent = String(raw);
+  });
+
+  slider("labelscale", (raw) => {
+    const v = raw / 100;
     state.style.labelScale = v;
     $("labelscale-out").textContent = `${v.toFixed(1)}×`;
+  });
+
+  $("spread").addEventListener("change", (event) => {
+    state.style.spread = event.target.checked;
+    render({ reselect: true });
+  });
+
+  $("show-all").addEventListener("change", (event) => {
+    state.style.ignoreCollisions = event.target.checked;
+    // Spreading is meaningless when nothing is being avoided.
+    $("spread").disabled = event.target.checked;
     render({ reselect: true });
   });
 
@@ -269,6 +297,37 @@ function wireControls() {
   });
 }
 
+// ------------------------------------------------------------------- search
+
+/** Not awaited by startup: the map should be usable before search is, and the
+ *  root file is small enough that it usually lands first anyway. */
+function startSearch() {
+  $("search").placeholder = "loading search index…";
+  fetch(`${DATA_URL}/search.json`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((root) => {
+      if (!root) throw new Error("no search index");
+      new Search({
+        baseUrl: DATA_URL,
+        root,
+        // state.style is passed live so results restyle when the theme changes.
+        categories: { categories: manifest.categories, style: state.style },
+        countries: manifest.countries ?? [],
+        input: $("search"),
+        results: $("results"),
+        onPick: ({ lon, lat }) => flyTo(lon, lat, Math.max(state.viewState.zoom, 11)),
+      });
+      $("search").placeholder = "Search places…";
+      $("search-note").textContent =
+        `${root.items.toLocaleString()} places above importance ` +
+        `${(root.minScore * 100).toFixed(0)} are findable`;
+    })
+    .catch(() => {
+      $("search").placeholder = "search index not built";
+      $("search").disabled = true;
+    });
+}
+
 // -------------------------------------------------------------------- startup
 
 async function start() {
@@ -276,6 +335,14 @@ async function start() {
     if (!r.ok) throw new Error("data/manifest.json not found - run the pipeline first");
     return r.json();
   });
+  if (!manifest.pack) {
+    throw new Error("this data was built by an older pipeline - rerun build_tiles");
+  }
+
+  const pack = new Pack({ baseUrl: DATA_URL, info: manifest.pack });
+  // Fail here, loudly, rather than three tiles in with a 90 MB download under
+  // way. Everything after this point assumes byte ranges work.
+  await pack.probe();
 
   state.style.palette = manifest.palette[state.theme];
   document.documentElement.dataset.theme = state.theme;
@@ -289,18 +356,17 @@ async function start() {
   filter.setPalette(state.style.palette);
 
   tiles = new TileManager({
-    baseUrl: DATA_URL,
+    pack,
     manifest,
     onUpdate: () => render({ reselect: true }),
   });
-  await tiles.loadIndexes();
 
   const fromHash = readHash();
   if (fromHash) state.viewState = { ...state.viewState, ...fromHash };
 
   deckgl = new deck.DeckGL({
     container: "map",
-    mapStyle: BASEMAPS[state.theme],
+    mapStyle: await basemapStyle(state.theme),
     viewState: state.viewState,
     controller: { doubleClickZoom: false, inertia: 250 },
     onViewStateChange,
@@ -317,40 +383,26 @@ async function start() {
   });
 
   wireControls();
-
-  // The search manifest lists every prefix that exists, which is over a
-  // megabyte. Deliberately not awaited: the map should be usable before it
-  // lands, and search wires itself up when it does.
-  $("search").placeholder = "loading search index…";
-  fetch(`${DATA_URL}/search/manifest.json`)
-    .then((r) => (r.ok ? r.json() : null))
-    .then((searchManifest) => {
-      if (!searchManifest) throw new Error("no search index");
-      new Search({
-        baseUrl: DATA_URL,
-        manifest: searchManifest,
-        // state.style is passed live so results restyle when the theme changes.
-        categories: { categories: manifest.categories, style: state.style },
-        input: $("search"),
-        results: $("results"),
-        onPick: ({ lon, lat }) => flyTo(lon, lat, Math.max(state.viewState.zoom, 11)),
-      });
-      $("search").placeholder = "Search places…";
-    })
-    .catch(() => {
-      $("search").placeholder = "search index not built";
-      $("search").disabled = true;
-    });
+  startSearch();
 
   $("data-note").textContent =
     `${manifest.itemCount.toLocaleString()} geolocated articles in ` +
-    `${manifest.tileCount.toLocaleString()} tiles · zoom 0–${manifest.maxZoom}`;
+    `${manifest.tileCount.toLocaleString()} tiles · zoom 0–${manifest.maxZoom} · ` +
+    `${(manifest.pack.bytes / 1e6).toFixed(0)} MB in ${manifest.pack.parts.length} file(s)`;
 
   window.addEventListener("resize", () => scheduleTiles());
   $("loading").classList.add("hidden");
 
   scheduleTiles();
   render({ reselect: true });
+}
+
+function onViewStateChange({ viewState }) {
+  state.viewState = viewState;
+  const items = render();      // immediate, from cache
+  scheduleLabels(items ?? []); // re-declutter once the view settles
+  scheduleTiles();             // fetch what is missing, without blocking the draw
+  writeHash();
 }
 
 start().catch((err) => {

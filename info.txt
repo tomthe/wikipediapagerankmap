@@ -4,69 +4,131 @@ I created a map of geolocated wikipedia articles, where the size of a label is
 relative to the "importance" of an article.
 The data is created from wikidata dump and pagerank datasets. Then converted into tiles.
 
-I lost the code to process the data and create the tiles. 
 
-I want to improve the data and the website (index.html)
+##
 
-* recreate the data pipeline: 
- * create one big parquet file with all geolocated articles and
-  * wikidata identifiers
-  * wikipedia title (english, original)
-  * coordinates (correct!)
-  * categorie of the thing (so that I can filter the map later!)
-  * importance
-    * pagerank
-    * Qrank
-    * combination
-    * ?
-  * more information about the thing
-   * ?
- * create tiles from that parquet
-  * maybe a better format than before? better compressed? Faster to read?
-  * of course the website needs to be able to read it
-  * the website code was not perfect: sometimes too much data was loaded. sometimes data disappears.... this could be improved
-  * 
-* improve the website
- * show categories and even subcategories
- * improve tile-loading and data handling
- * Improve links and hover information
+ok, I want all the information in the tiles, includung all the descr_en (20% is great for the value added)
+I also want to be able to tune the sizes of labels by population, for entities with a population.
 
-* maybe improve the search... but this is difficult. Maybe with another prepared data pipeline, which creates 
-  an index (aaa.json contains all the words+coordinates that begin with aaa... ? )
+Yes, putting everything into one file that is accessible with range requests seems like a good strategy. Please do this.
+Could I host this on my netcup shared hosting and then put cloudfare in front of it? Although I would still prefer Github pages.
+The search should not just be capped. It can be capped at a low importance level, so that unimportant stuff can't be found
+
+Yes, please switch the basemap to Openfreemap as you suggested, with suppressing the labels.
+
+
+The "minimum importance" slider can be replaced with a maximum importance slider.
+I often have the problem, that imporant stuff is at the same place. How can we resolve this? A maximum importance slider is one solution.
+ Jitter would be another solution. An option to show all labels, now matter collisions would be a third solution...
+
+### remaining issues
+
+* add People and other stuff that are only indirectly geolocated
+  * No Human has a geolocation in Wikidata, but more than half have a birthplace or other associated regions
+  * For Humans, pets and maybe some more categories (which ones?), we could choose birthplace (or death or other regions), look up thoose coordinates and use them. (e.g. Albert Einstein's Wikidata entry has many residences, birthplace (Ulm), place of death (Princeton), employers...) Place of birth is most often there and most informative. Place of death if place of birth is not available
+* add selected categories to the URL?
+* Upload to github, add link to github.
 
 
 
+## 
 
-## Downloaded data
+1. What's in the tiles, and what a richer tooltip would cost
+The tile carries exactly this per item (decode.js:70-82): qid, lon/lat, drawn title, wiki (lang|title), hasImage, score, pr, qr, cat, sub. Averaged over the pyramid that's 29.9 gzipped bytes per item → 296 MB.
 
-available in G:\tt\wikidata
-I downloaded wikidump truthy (maybe not complete yet? might be ready in 30 minutes), danker PareRank and Qrank
+Already paid for, currently unused in the hover:
 
-# Data info internet
+hasImage — decoded at decode.js:76 and never read anywhere. A 📷 glyph is free.
+pr and qr separately — the tooltip collapses them into one "importance"; the split is the interesting part when you're playing with the weight slider.
+qid and coordinates — free.
+What adding fields would actually cost. I sampled 271 real tiles across all 13 zooms, joined them back to articles.parquet, appended each candidate column to the real payload and re-gzipped, so these are true marginal costs:
 
-Yes — and there's a dataset that makes the Wikidata join essentially free, because it's already keyed by Q-ID.
-The best fit: danker
-danker computes PageRank over Wikipedia's internal link graph and outputs a TSV of Wikidata Q-IDs with their PageRank score, sorted descending. It downloads the Wikimedia dump files, resolves links, redirects, and Q-IDs itself, and pre-computed outputs are published at https://danker.s3.amazonaws.com/index.html under CC BY-SA 3.0. Files are named like 2022-11-10.allwiki.links.rank.bz2. GitHubgithub
-Two flavors matter for you:
+Field	encoding	B/item	total	% of 296 MB
+country_label	global u16 id	0.10	+1 MB	0.3%
+n_sitelinks	u8 clamped	0.23	+2 MB	0.8%
+population	log-scaled u16	0.23	+2 MB	0.8%
+inception	i16 year	0.33	+3 MB	1.2%
+elevation	i16 metres	0.39	+4 MB	1.4%
+admin_label	per-tile dict + u8	1.32	+14 MB	4.7%
+admin_label	u32 offsets + utf8	3.10	+32 MB	10.9%
+descr_en	u32 offsets + utf8	5.59	+58 MB	19.7%
+(My extrapolation over-counts items by ~10%, so read the MB column as ~10% high.)
 
-Single language (e.g. en) — the classic "PageRank of English Wikipedia."
-ALL — links from every language edition, aligned via each article's Wikidata Q-ID, using what the author calls a bag-of-links model: a link that appears in 254 language editions counts 254 times, so each language edition acts as a voting entity. For a geographic notability signal this is usually what you want — it captures global prominence rather than anglophone prominence. GitHubgithub
+Everything except descr_en is essentially free: all six together are 2.6 B/item, +25 MB, +8% on the tiles and +3% on the whole site. The reason country costs 0.10 B/item is that a tile is almost always one country, so gzip erases the column. admin wants a per-tile string table rather than one string per item — that's the difference between 1.3 and 3.1 B/item.
 
-The raw edge list is also published separately if you'd rather run your own algorithm: a Wikipedia link graph with all article identifiers normalized to Q-IDs, containing links from all language versions, on Zenodo. Zenodo
-One caveat on the scores: danker does not compute the normalized version of PageRank — it uses (1 - damping) rather than (1 - damping)/N, so scores don't sum to 1. Ranking is unaffected, but don't treat the numbers as probabilities. github
-Alternatives
-WikiLinkGraphs if you want a cleaner or historical graph: yearly snapshots of the internal link network for the 9 largest language editions, 2001 to March 2018, parsed from article wikitext so that template-generated links are excluded — discarding more than half the links and keeping only those editors intentionally added. Downloadable from Zenodo (doi:10.5281/zenodo.2539424). Keyed by page_id/page_title, so you'd need a sitelinks join, and it stops at 2018. arXivConsonni
-QRank if "importance" rather than "PageRank" is the real goal. It's built from Wikimedia pageviews aggregated over twelve months, joined to Q-IDs via the sitelinks in the Wikidata dump. It was designed for exactly your kind of use case (deciding which map features deserve labels), and pageviews arguably beat link structure for that. GitHub
-Roll your own from pagelinks.sql.gz + page.sql.gz + redirect.sql.gz. Doable but note the pagelinks schema changed a few years back — link targets moved into a separate linktarget table, so older tutorials showing pl_title/pl_namespace no longer apply. Worth verifying against the current dump before writing the parser.
-Getting the coordinates
-Wikidata property P625 (coordinate location). Three routes, roughly in order of practicality:
+That buys you a tooltip like:
 
-Truthy dump grep — download latest-truthy.nt.bz2 and filter for the P625 predicate. Streams in one pass, gives you ~10M rows, no query timeouts:
 
-   bzcat latest-truthy.nt.bz2 | grep -F 'prop/direct/P625>'
+Zugspitze
+Mountain · Nature · Bavaria, Germany
+2,962 m · 47 language editions · importance 41
+PageRank 38 · pageviews 44 · 📷
+descr_en ("capital of France") is the single best line you could add and the only expensive one at +20%. Restricting it to z ≤ 8 costs only +13 MB and covers everything visible above city zoom, but then the tooltip is inconsistent about when it has a description. I'd rather pay the full +58 MB — and section 2 frees up eight times that.
 
-QLever's public Wikidata endpoint — handles full-dataset SPARQL scans that WDQS will time out on. Good for SELECT ?item ?coord WHERE { ?item wdt:P625 ?coord }.
-WDQS — fine if you're slicing by country or class, will time out on the unrestricted query.
+2. GitHub Pages
+The documented limits: 1 GB published site (hard), 1 GB recommended source repo, 100 GB/month bandwidth (soft), 10 builds/hour, and it's "not intended for commercial operations".
 
-Gotcha: P625 serializes as WKT, Point(lon lat) — longitude first. Swapping these is the single most common bug in this pipeline.
-Then it's a plain join on Q-ID. Two analytical notes: filter to the geo subset first and re-rank within it, since raw PageRank is dominated by countries, years, and languages; and be aware that "Portugal" and "1994" both carry enormous PageRank while a specific mountain won't — so the score distribution across geographic entity types is wildly skewed, and you may want to normalize within P31 class.
+Your payload today:
+
+files	bytes
+data/tiles/	98,755	296 MB
+data/search/	84,682	520 MB
+total	183,437	816 MB
+It fits, with 22% headroom. Five things would bite:
+
+It won't survive a second data build. Every pipeline rerun rewrites all 183k files, and git keeps the old ones forever. The tiles are already gzipped so git can't recompress them. Run the pipeline twice and the repo is past its recommended size; four times and you're in trouble that only a history rewrite fixes.
+The search index is 64% of the site and mostly dead weight. 59,518 level-3 shards: median 77 bytes, p90 3.4 KB, p99 146 KB, max 7.65 MB. 2,023 shards hold 369 of the 424 MB. Meanwhile search.js:7 renders 12 results and re-ranks inside the shard — so someone typing three common letters downloads 7.65 MB to look at twelve rows.
+183k files makes clone, git status and push slow, especially from a network share.
+Bandwidth is fine until it isn't. A cold visit costs ~1 MB of your bytes (10 KB html + 45 KB src + 4 KB manifest + 207 KB of zoom indexes + 289 KB gzipped search manifest + 200-500 KB of tiles), so 100 GB ≈ 100k visits. One front-page day plus a few fat search shards changes that arithmetic fast.
+unpkg. index.html:11-13 pulls ~2.2 MB of maplibre + deck.gl from a third-party CDN. Their outage is your white screen. Vendor both files.
+Fix (2) first and everything else relaxes. Capping each level-3 shard (entries are already score-sorted) and gzipping them, reusing the maybeGunzip helper that already exists at decode.js:19:
+
+cap	raw total	~gzipped	shards truncated
+none	424 MB	—	—
+32 KB (~500 entries)	118 MB	~35 MB	1,929
+8 KB (~130 entries)	55 MB	~16 MB	4,064
+I'd take the 32 KB cap: site goes 816 MB → ~330 MB, worst-case keystroke goes 7.65 MB → 32 KB, and you keep enough tail that an obscure exact-prefix match still survives. Also gzip or drop the search manifest (1.26 MB raw, 289 KB gzipped, paid by every visitor before they type anything — a 404-driven fallback to shorter prefixes would cost one wasted request instead).
+
+After that, GitHub Pages is genuinely comfortable, and you can afford descr_en in the tiles.
+
+3. Shared hosting vs Pages
+GitHub Pages	your shared host
+CDN	yes (Fastly)	no — one origin
+re-publishing data	grows history ~800 MB each time	rsync overwrites in place
+file count	fine	check your inode quota — 183k files breaches many plans
+upload	git push	hours over FTP; use rsync/SSH, or upload a tar and extract
+headers	fixed	yours (Content-Encoding, Cache-Control, CORS)
+size cap	1 GB	your plan
+Neither is strictly better: shared hosting wins on iteration, Pages wins on audience. The combination that beats both is Pages for the site (a few hundred KB) + the data in an object store with free egress — Cloudflare R2 with a public bucket is the usual answer (no file-count limit, no egress charge; you'd need CORS on the bucket and an absolute DATA_URL in main.js:17). Note Cloudflare Pages is out — it caps at 20,000 files.
+
+The structural fix, if you want this bulletproof on any host: pack the tiles into one file addressed by HTTP Range, PMTiles-style. 98,755 files → 1, and your per-zoom index becomes the offset table. Fastly, Apache and nginx all serve ranges. It's a day of work and it makes the file-count question disappear permanently.
+
+4. The basemap
+You're on CARTO positron/dark-matter no-labels with no API key, and attribution does render (I confirmed "© CARTO, © OpenStreetMap contributors" in the screenshot). But CARTO's own docs say commercial use needs an Enterprise licence and free use is for "CARTO grantees" — there's no documented anonymous tier. basemaps.cartocdn.com works because it's unauthenticated, not because you're entitled to it; the historically quoted non-commercial allowance was 75,000 mapviews/month. For an MPIDR research map that's probably fine, and you could apply for a grant, but a viral day could get you rate-limited with no warning.
+
+OpenFreeMap is the low-friction swap: no API key, no registration, explicitly "no limits on the number of map views or requests", commercial use allowed, self-hostable, donation-funded (so: no SLA). Attribution required — "OpenFreeMap © OpenMapTiles Data from OpenStreetMap". One caveat that matters for you: there's no nolabels variant, so you'd fetch the style JSON and drop layers with a layout['text-field'] before passing it as mapStyle. About ten lines, and it also lets you dark-mode the style yourself.
+
+Other options: MapTiler/Stadia have real free tiers but put a scrapeable key in your public page (domain-lock it). Protomaps if you want to self-host a .pmtiles. And since your basemap is only a backdrop, a Natural Earth land+coastline GeoJSON (~1 MB) in a deck.gl layer would remove the external dependency entirely below z≈7. Don't point at tile.openstreetmap.org — their usage policy forbids it.
+
+5. Settlements and Administrative off by default — done
+main.js:18-22 — DEFAULT_OFF = ["Settlements", "Administrative"]
+categories.js:15-32 — the filter takes defaultOff and initialises catOn/subOn from it; checkboxes render from that state rather than hardcoded true
+main.js:262-264 — the all/none toggle starts at false so the first click turns everything on rather than clearing a partial selection
+interaction_check.mjs:186-195 — the density-slider test now turns all categories on first; its premise was "more candidates exist than fit at budget 50", which the new default broke
+Verified in headless Edge: browser_check gives 31 labels of 770 places (was 48 of 2,078), no console errors, and interaction_check passes all 12 steps.
+
+One thing the screenshot surfaced: with Settlements gone, the biggest labels over Europe become languages — Danish, Yiddish, Slovak, Hungarian, Belarusian. They're geolocated Wikidata items with enormous PageRank sitting in category Other. It is more interesting than a wall of city names, but you may want taxonomy.py to give languages and peoples their own subcategory so they're separately switchable.
+
+Bash Check tail of completed du output
+IN
+tail -n 5 "C:/Users/theile/AppData/Local/Temp/24/claude/u--detest-wikipediapagerankmap/9064ceda-2f63-4cd7-963f-d833c51a92ac/tasks/bsudn8v53.output"
+
+OUT
+        "Sea",
+=== tiles du ===
+471M	data/tiles
+=== search du ===
+616M	data/search
+The earlier du finished — it reports 471M for tiles and 616M for search, versus the 296 MB / 520 MB I quoted. That's not a contradiction: du counts allocated blocks, my figures count actual bytes. With 183k files averaging ~4.5 KB against a 4 KB cluster, slack space adds ~60%.
+
+The byte figures in my answer stand (that's what a host transfers and what GitHub Pages measures). But it does sharpen one point: on a shared host's disk quota the site occupies ~1.1 GB, not 816 MB, because quotas are billed in blocks. Another argument for capping the search shards — and a strong one for packing the tiles into a single range-addressed file, which would collapse the slack to nothing.
