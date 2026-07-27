@@ -230,6 +230,22 @@ function wireControls() {
     applyTheme(state.theme === "dark" ? "light" : "dark")
   );
 
+  const controls = $("controls");
+  const collapseBtn = $("collapse-btn");
+  const setCollapsed = (collapsed) => {
+    controls.classList.toggle("collapsed", collapsed);
+    collapseBtn.setAttribute("aria-expanded", String(!collapsed));
+    // The panel's footprint changed, so labels may now be free to use the
+    // space it used to cover (or need to avoid it again).
+    render({ reselect: true });
+  };
+  collapseBtn.addEventListener("click", () =>
+    setCollapsed(!controls.classList.contains("collapsed"))
+  );
+  // Small screens: start collapsed so the panel is a compact bar rather than
+  // a card that covers most of the map.
+  setCollapsed(window.matchMedia("(max-width: 640px)").matches);
+
   const slider = (id, apply) => {
     const el = $(id);
     el.addEventListener("input", () => {

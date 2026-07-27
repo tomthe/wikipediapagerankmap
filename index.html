@@ -60,7 +60,7 @@
 
     /* ---- left control panel ---- */
     #controls {
-      top: 12px; left: 12px; width: 306px;
+      top: 12px; left: 12px; width: min(306px, calc(100vw - 24px));
       max-height: calc(100vh - 24px);
       display: flex; flex-direction: column;
       z-index: 10;
@@ -77,8 +77,18 @@
       border: 1px solid var(--ring); background: transparent; color: var(--ink-2);
       border-radius: 6px; width: 26px; height: 24px; cursor: pointer;
       font-size: 13px; line-height: 1; display: grid; place-items: center;
+      flex: none;
     }
     .icon-btn:hover { background: var(--hairline); color: var(--ink); }
+
+    #collapse-btn { transition: transform .15s; }
+    #controls.collapsed #collapse-btn { transform: rotate(-90deg); }
+    /* Collapsed: only the header bar (title + buttons) remains visible, so
+       the panel reads as a small pill instead of covering the map. */
+    #controls.collapsed .search-wrap,
+    #controls.collapsed .scroll {
+      display: none;
+    }
 
     .search-wrap { padding: 0 12px 10px; position: relative; }
     #search {
@@ -156,7 +166,7 @@
 
     /* ---- detail panel ---- */
     #detail {
-      top: 12px; right: 12px; width: 320px;
+      top: 12px; right: 12px; width: min(320px, calc(100vw - 24px));
       max-height: calc(100vh - 24px); overflow-y: auto;
       display: none; z-index: 10;
     }
@@ -215,6 +225,7 @@
     <header>
       <h1>Wikipedia importance map</h1>
       <button class="icon-btn" id="theme-btn" title="Toggle light / dark">◐</button>
+      <button class="icon-btn" id="collapse-btn" title="Collapse / expand panel" aria-expanded="true">▾</button>
     </header>
 
     <div class="search-wrap">
