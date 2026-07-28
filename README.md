@@ -1,3 +1,14 @@
+# Moved to new URL:
+
+repository:
+https://github.com/tomthe/wiki-importance-map
+
+website:
+https://tomthe.github.io/wiki-importance-map/
+
+
+
+
 # Wikipedia PageRank map
 
 Every geolocated Wikipedia article on a map, with label size driven by how
