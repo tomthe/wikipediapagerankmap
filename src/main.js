@@ -21,6 +21,9 @@ const DATA_URL = "data";
 // already favours - they dominate every zoom and mostly restate what the
 // basemap says. Starting with them off makes the first view show the things
 // people came for, and both are one click away.
+//
+// People deliberately starts ON. It is the layer this map did not have, and
+// unlike Settlements it duplicates nothing underneath it.
 const DEFAULT_OFF = ["Settlements", "Administrative"];
 
 const $ = (id) => document.getElementById(id);

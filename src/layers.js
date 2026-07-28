@@ -74,20 +74,33 @@ export function buildLayers({ items, labelled, style, theme, onHover, onClick })
     labelBudget,
   };
 
+  // Hollow dots for items drawn at a coordinate they do not own - a person at
+  // their birthplace, a painting at its museum. It is a non-colour channel, so
+  // it stacks with the category hue instead of competing with it, and it says
+  // the one thing colour cannot: this point is approximate. Filled means the
+  // item really is there.
   const dots = new ScatterplotLayer({
     id: "dots",
     data: items,
     pickable: true,
-    stroked: false,
+    stroked: true,
     filled: true,
+    lineWidthUnits: "pixels",
     radiusUnits: "pixels",
     radiusMinPixels: 1.2,
     radiusMaxPixels: 9,
     getPosition: (d) => d.position,
     getRadius: (d) =>
       1.4 + 7 * Math.pow(weightOf(d, qrankWeight, populationWeight), 1.6),
-    getFillColor: (d) => [...colors[d.cat], dotAlpha],
-    updateTriggers: { getRadius: triggers, getFillColor: triggers },
+    getFillColor: (d) => (d.derived ? [0, 0, 0, 0] : [...colors[d.cat], dotAlpha]),
+    getLineColor: (d) => [...colors[d.cat], d.derived ? dotAlpha : 0],
+    getLineWidth: (d) => (d.derived ? 1.2 : 0),
+    updateTriggers: {
+      getRadius: triggers,
+      getFillColor: triggers,
+      getLineColor: triggers,
+      getLineWidth: triggers,
+    },
     onHover,
     onClick,
   });

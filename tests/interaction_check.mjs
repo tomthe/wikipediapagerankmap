@@ -108,10 +108,11 @@ step("map has more places than labels", base.places > base.labels, base.status);
 const defaults = await evaluate(`(() => {
   const boxes = [...document.querySelectorAll('#categories input[data-cat]')]
     .filter(b => b.dataset.sub === undefined);
+  const named = (b) => b.closest(".cat-row").querySelector(".name").textContent;
   return {
     total: boxes.length,
-    off: boxes.filter(b => !b.checked)
-      .map(b => b.closest(".cat-row").querySelector(".name").textContent),
+    all: boxes.map(named),
+    off: boxes.filter(b => !b.checked).map(named),
   };
 })()`);
 step(
@@ -124,6 +125,18 @@ step(
   defaults.total === 0
     ? "the category panel had not rendered yet"
     : `${defaults.total} categories, off: ${JSON.stringify(defaults.off)}`
+);
+step(
+  "People is a category of its own",
+  defaults.all.includes("People"),
+  JSON.stringify(defaults.all)
+);
+step(
+  // It is the layer the map did not have, and it duplicates nothing on the
+  // basemap underneath, so it is the one new category that starts visible.
+  "People starts switched on",
+  defaults.all.includes("People") && !defaults.off.includes("People"),
+  `off: ${JSON.stringify(defaults.off)}`
 );
 
 // --- 2. unchecking a category removes its items -----------------------------
@@ -238,6 +251,73 @@ step(
   panel.links.length === 4 && panel.links[0].startsWith("Wikipedia"),
   JSON.stringify(panel.links)
 );
+
+// --- 5b. an item at a borrowed coordinate says so ---------------------------
+// A person is drawn at their birthplace, nudged aside so the others born there
+// are still reachable. Everything the panel says about position therefore has
+// to be hedged - and the map links have to be gone, because they would drop a
+// pin on a spot this map invented.
+const borrowed = await evaluate(`(async () => {
+  const mod = await import("./src/ui.js");
+  const manifest = await (await fetch("data/manifest.json")).json();
+  const p = new mod.DetailPanel({
+    panel: document.getElementById("detail"),
+    body: document.getElementById("detail-body"),
+    closeButton: document.getElementById("detail-close"),
+    categories: manifest,
+  });
+  const item = {
+    qid: 937, title: "Albert Einstein", wiki: "Albert Einstein", wikiLang: "en",
+    position: [9.9937, 48.4011], score: 0.9, pr: 0.9, qr: 0.9,
+    cat: manifest.peopleCat, sub: 1, hasImage: true,
+    descr: "German-born theoretical physicist",
+    pop: null, elev: null, year: 1879, sitelinks: 255,
+    country: "Germany", admin: "Ulm", locSrc: 1, derived: true,
+  };
+  p.open(item);
+  await ${sleep(3500)};
+  const body = document.getElementById("detail-body");
+  const dts = [...body.querySelectorAll("dt")].map(d => d.textContent);
+  const dds = [...body.querySelectorAll("dd")].map(d => d.textContent);
+  return {
+    meta: body.querySelector(".meta")?.textContent ?? "",
+    facts: Object.fromEntries(dts.map((k, i) => [k, dds[i]])),
+    links: [...body.querySelectorAll(".links a")].map(a => a.textContent),
+    place: mod.formatPlace(item, manifest),
+  };
+})()`);
+step(
+  "a derived location reads as 'born in Ulm, Germany'",
+  borrowed.place === "born in Ulm, Germany",
+  JSON.stringify(borrowed.place)
+);
+step(
+  "the panel names the place it borrowed from",
+  (borrowed.facts["Born in"] ?? "") === "Ulm",
+  JSON.stringify(borrowed.facts)
+);
+step(
+  "the position is flagged as approximate",
+  /approximate/i.test(borrowed.facts["Position"] ?? ""),
+  JSON.stringify(borrowed.facts["Position"])
+);
+step(
+  "no exact coordinates are claimed for a borrowed point",
+  !("Coordinates" in borrowed.facts),
+  JSON.stringify(borrowed.facts["Coordinates"])
+);
+step(
+  "a person's year is labelled as a birth, not a founding",
+  "Born" in borrowed.facts && !("Founded" in borrowed.facts),
+  JSON.stringify(Object.keys(borrowed.facts))
+);
+step(
+  "map links are withheld for an invented coordinate",
+  borrowed.links.length === 2 &&
+    !borrowed.links.some(l => /OpenStreetMap|Google/.test(l)),
+  JSON.stringify(borrowed.links)
+);
+await evaluate(`document.getElementById("detail-close").click()`);
 // The new tile columns have to survive all the way to the panel, or paying
 // 20% on the pyramid for descr_en bought nothing.
 step(

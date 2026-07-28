@@ -30,6 +30,8 @@ console.log(
       descr: i.descr,
       hasImage: i.hasImage,
       hasWebsite: i.hasWebsite,
+      locSrc: i.locSrc,
+      derived: i.derived,
       cat: i.cat,
       sub: i.sub,
       pop: i.pop,
