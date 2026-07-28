@@ -585,9 +585,15 @@ For the site itself, start a headless Chromium with
 `--remote-debugging-port=9222` and run:
 
 ```sh
+node tests/hash_check.mjs                          # no browser needed
 node tests/browser_check.mjs http://localhost:8000/ shot.png
 node tests/interaction_check.mjs http://localhost:8000/
 ```
+
+`hash_check` round-trips the category selection through its URL form and is
+mostly about links this build did not write: a token from an older manifest, one
+somebody edited by hand, one from a future taxonomy. It needs no browser and no
+data, because `encodeSelection` and `parseSelection` are plain functions.
 
 `browser_check` reports console errors, failed requests, how many tile and
 search requests were made and how many labels were drawn, and saves a
@@ -596,7 +602,9 @@ selection, that People is present and starts on, filtering a category off and
 back on, subcategory expansion, search, flying to a result, the detail panel
 with its live Wikipedia summary and thumbnail, that the new tile columns reach
 that panel, the density slider, all three crowding controls, population sizing,
-and all / none.
+and all / none. It also drives the shareable URL in both directions — that a
+change to the selection reaches the hash, that a pasted hash reaches the panel
+and the map, and that a link with no selection restores the defaults.
 
 It also pins down the honesty rules for a borrowed coordinate, which are the
 easiest thing here to regress silently: that the place line reads "born in Ulm,
@@ -638,7 +646,7 @@ and the deepest-zoom budget both have something to bite on.
 | `src/decode.js` | the binary tile decoder |
 | `src/declutter.js` | screen-space label selection and displacement |
 | `src/layers.js` | deck.gl label, leader-line and dot layers |
-| `src/categories.js` | category/subcategory filter and panel |
+| `src/categories.js` | category/subcategory filter, panel, and its URL form |
 | `src/search.js` | prefix search against the packed shards |
 | `src/basemap.js` | OpenFreeMap style, with the text layers removed |
 | `src/ui.js` | tooltip and detail panel |
@@ -706,8 +714,52 @@ Hover shows the name, category, description, where it is, population,
 elevation, founding year and both importance signals — all of it out of the
 tile, so nothing is fetched while panning. Clicking opens a panel that adds the
 Wikipedia summary and thumbnail for that one item from the REST API, with links
-to Wikipedia, Wikidata, OpenStreetMap and Google Maps. The map position lives
-in the URL hash, so a view can be shared.
+to Wikipedia, Wikidata, OpenStreetMap and Google Maps.
+
+### Sharing a view
+
+The URL hash holds the position **and the category selection**, because those
+are the two halves of what someone is looking at and a screenshot can only show
+one of them. A link to nothing but battles is a different map from a link to the
+same coordinates.
+
+```
+#5.00/48.8566/2.3522                 where the map is looking
+#5.00/48.8566/2.3522/cat=0~1         …showing only Other → Battle
+```
+
+Everything after the three numbers is a `key=value` segment, so a link made
+before `cat=` existed still works and an unknown key is ignored rather than
+throwing the view away. The selection grammar (`src/categories.js`) uses only
+characters a fragment leaves alone, so nothing is ever percent-escaped:
+
+| token | means |
+|---|---|
+| `all`, `none` | every category, no category |
+| `0.2.9` | those three, all of their subcategories |
+| `0~1,3-5` | category 0, only subcategories 1 and 3–5 |
+| `9!0` | category 9, all of its subcategories except 0 |
+| *(absent)* | however the map opens — see `DEFAULT_OFF` |
+
+`~` and `!` both exist because a partial selection is usually "the one I ticked"
+or "the one I unticked", and whichever spells it shorter is the one written:
+unticking one of People's 28 subcategories costs three characters, not sixty.
+
+Three rules keep old and hand-edited links from doing something stupid:
+
+* **The default is never spelled out.** A selection appears in the hash only
+  when it differs from what the site opens with, so the common link stays short
+  and keeps meaning "the default" if the defaults later change.
+* **Unknown ids and out-of-range subcategories are dropped, not fatal.** A
+  category the manifest no longer has is skipped and the rest of the token still
+  applies, because a rebuild can renumber the taxonomy.
+* **A token that means nothing leaves the defaults alone.** `cat=banana`
+  resolves to no selection at all, and resolving that to an empty map would turn
+  one stale link into a blank page. `cat=none` is a choice and is honoured.
+
+Pasting a link into a tab that already has the map open works too: `hashchange`
+applies the whole link, position and selection together. `history.replaceState`
+does not fire that event, so the handler only ever sees a link from outside.
 
 For an item at a borrowed coordinate all of that shifts one step back from the
 map. The dot is hollow, the hover reads *born in Ulm, Germany*, the panel calls

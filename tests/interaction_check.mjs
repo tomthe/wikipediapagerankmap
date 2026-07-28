@@ -178,6 +178,85 @@ const subs = await evaluate(`(async () => {
 })()`);
 step("subcategories expand", subs.open && subs.count > 5, JSON.stringify(subs));
 
+// --- 3b. the selection is in the URL ----------------------------------------
+// A screenshot cannot show which categories are ticked, so the link has to. Both
+// directions are checked, because either one alone is useless: the hash has to
+// carry a change out, and a pasted hash has to bring one in.
+const shared = await evaluate(`(async () => {
+  const rows = () => [...document.querySelectorAll("#categories .cat-row")];
+  const row = (name) => rows().find(r => r.querySelector(".name")?.textContent === name);
+  const box = (name) => row(name).querySelector('input[type="checkbox"]');
+  const catBoxes = () => [...document.querySelectorAll(
+    '#categories input[data-cat]:not([data-sub])')];
+  const checkedNames = () => catBoxes().filter(b => b.checked)
+    .map(b => b.closest(".cat-row").querySelector(".name").textContent);
+
+  const manifest = await (await fetch("data/manifest.json")).json();
+  const nature = manifest.categories.find(c => c.name === "Nature").id;
+
+  // out: unticking a category has to show up in the hash
+  const defaultHash = location.hash;
+  box("Nature").click();
+  await ${sleep(900)};
+  const afterToggle = location.hash;
+
+  // in: a link somebody else made, with one subcategory of one category
+  location.hash = "#4.00/48.0000/9.0000/cat=" + nature + "~1";
+  await ${sleep(2500)};
+  const applied = {
+    hash: location.hash,
+    cats: checkedNames(),
+    subs: [...document.querySelectorAll(
+      '#categories input[data-cat="' + nature + '"][data-sub]')]
+      .filter(b => b.checked).map(b => Number(b.dataset.sub)),
+    places: Number(/of ([\\d,]+) places/.exec(
+      document.getElementById("status-text").textContent)[1].replace(/,/g, "")),
+  };
+
+  // a link with no selection means "however the map opens"
+  location.hash = "#3.40/47.0000/8.0000";
+  await ${sleep(2500)};
+  const reset = checkedNames();
+  // and once it is back to the default, the hash should stop mentioning it
+  box("Nature").click();
+  await ${sleep(500)};
+  box("Nature").click();
+  await ${sleep(900)};
+  return { defaultHash, afterToggle, applied, reset, backToDefault: location.hash };
+})()`);
+step(
+  "the default selection is not spelled out in the hash",
+  !/cat=/.test(shared.defaultHash),
+  shared.defaultHash
+);
+step(
+  "unticking a category writes it into the hash",
+  /cat=/.test(shared.afterToggle),
+  shared.afterToggle
+);
+step(
+  "a shared link applies its category selection",
+  shared.applied.cats.length === 1 &&
+    shared.applied.cats[0] === "Nature" &&
+    JSON.stringify(shared.applied.subs) === "[1]",
+  JSON.stringify(shared.applied)
+);
+step(
+  "a shared link still moves the map",
+  /^#4\.00\//.test(shared.applied.hash) && shared.applied.places > 0,
+  JSON.stringify(shared.applied)
+);
+step(
+  "a link with no selection restores the defaults",
+  shared.reset.length > 1 && !shared.reset.includes("Settlements"),
+  JSON.stringify(shared.reset)
+);
+step(
+  "the hash drops the selection again once it is the default",
+  !/cat=/.test(shared.backToDefault),
+  shared.backToDefault
+);
+
 // --- 4. search finds a place and flies to it --------------------------------
 const search = await evaluate(`(async () => {
   const input = document.getElementById("search");
