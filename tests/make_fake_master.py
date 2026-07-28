@@ -20,7 +20,13 @@ import numpy as np
 import polars as pl
 
 from pipeline import config
-from pipeline.taxonomy import CATEGORIES, subcategory_names
+from pipeline.taxonomy import CATEGORIES, CATEGORY_ID, subcategory_names
+
+PEOPLE_CAT = CATEGORY_ID["People"]
+# How many people to hang off each city, so the phyllotaxis spread in
+# build_tiles has coincident points to actually spread and the deepest-zoom
+# budget has something to bite on.
+N_PEOPLE_PER_CITY = 900
 
 CITIES = [
     ("London", -0.1276, 51.5072, "United Kingdom", "Greater London"),
@@ -41,37 +47,71 @@ N_SCATTER = 8000
 def main() -> None:
     rng = np.random.default_rng(20260727)
     lons, lats, names, countries, admins = [], [], [], [], []
+    # Parallel arrays for the derived-location columns. A place row leaves them
+    # null; a person row carries the city it was born in.
+    loc_pids, loc_qids, loc_labels, loc_pops = [], [], [], []
 
-    for name, lon, lat, country, admin in CITIES:
+    def place_row(lon, lat, name, country, admin):
         lons.append(lon)
         lats.append(lat)
         names.append(name)
         countries.append(country)
         admins.append(admin)
-        spread = 0.35
-        lons.extend(lon + rng.normal(0, spread, N_PER_CITY))
-        lats.extend(lat + rng.normal(0, spread * 0.6, N_PER_CITY))
-        names.extend(f"{name} place {j}" for j in range(N_PER_CITY))
-        countries.extend([country] * N_PER_CITY)
-        admins.extend([admin] * N_PER_CITY)
+        loc_pids.append(0)
+        loc_qids.append(None)
+        loc_labels.append(None)
+        loc_pops.append(None)
 
-    lons.extend(rng.uniform(-180, 180, N_SCATTER))
-    lats.extend(rng.uniform(-60, 70, N_SCATTER))
-    names.extend(f"Remote thing {j}" for j in range(N_SCATTER))
-    countries.extend([None] * N_SCATTER)
-    admins.extend([None] * N_SCATTER)
+    for city_index, (name, lon, lat, country, admin) in enumerate(CITIES):
+        place_row(lon, lat, name, country, admin)
+        spread = 0.35
+        for j in range(N_PER_CITY):
+            place_row(
+                lon + rng.normal(0, spread),
+                lat + rng.normal(0, spread * 0.6),
+                f"{name} place {j}",
+                country,
+                admin,
+            )
+        # Everyone "born" here shares the city's exact coordinate, which is the
+        # case build_tiles has to cope with: without the spread they would be
+        # one dot with nine hundred things behind it.
+        for j in range(N_PEOPLE_PER_CITY):
+            lons.append(lon)
+            lats.append(lat)
+            names.append(f"Person {j} of {name}")
+            countries.append(country)
+            admins.append(admin)
+            # P19 place of birth for most, P20 place of death for a few, so
+            # both flag codes appear in the fixture.
+            loc_pids.append(config.P_BIRTHPLACE if j % 9 else config.P_DEATHPLACE)
+            loc_qids.append(900_000 + city_index)
+            loc_labels.append(name)
+            loc_pops.append(float(200_000 * (city_index + 1)))
+
+    for j in range(N_SCATTER):
+        place_row(
+            float(rng.uniform(-180, 180)),
+            float(rng.uniform(-60, 70)),
+            f"Remote thing {j}",
+            None,
+            None,
+        )
 
     n = len(lons)
     subs = subcategory_names()
+    is_person = np.array([p != 0 for p in loc_pids])
     cat = rng.integers(0, len(CATEGORIES), n)
+    cat[is_person] = PEOPLE_CAT
     sub = np.array([rng.integers(0, len(subs[CATEGORIES[c]])) for c in cat])
 
     # Heavy-tailed importance, plus a guaranteed high score for the real cities
     # so they land in the shallow tiles.
     pr = rng.power(0.35, n)
     qr = rng.power(0.35, n)
+    stride = 1 + N_PER_CITY + N_PEOPLE_PER_CITY
     for i in range(len(CITIES)):
-        idx = i * (N_PER_CITY + 1)
+        idx = i * stride
         pr[idx] = 0.93 + 0.06 * rng.random()
         qr[idx] = 0.93 + 0.06 * rng.random()
 
@@ -114,6 +154,12 @@ def main() -> None:
                 has_year,
                 [f"{y:04d}-01-01T00:00:00Z" for y in rng.integers(800, 2020, n)],
             ),
+            # People get a birth date instead of an inception date, which is
+            # what build_tiles puts in the shared `year` column for them.
+            "birth": [
+                f"{y:04d}-03-04T00:00:00Z" if p else None
+                for p, y in zip(is_person, rng.integers(1500, 2000, n))
+            ],
             "n_sitelinks": rng.integers(0, 300, n).astype(np.int64),
             "country_label": countries,
             "admin_label": admins,
@@ -126,6 +172,10 @@ def main() -> None:
                 for v in rng.random(n) < 0.3
             ],
             "website": ["https://example.org" if v else None for v in rng.random(n) < 0.1],
+            "loc_pid": np.asarray(loc_pids, dtype=np.uint32),
+            "loc_qid": pl.Series(loc_qids, dtype=pl.UInt32),
+            "loc_label": loc_labels,
+            "loc_pop": loc_pops,
         }
     ).sort("score", descending=True)
 

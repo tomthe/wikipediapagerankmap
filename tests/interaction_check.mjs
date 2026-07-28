@@ -108,10 +108,11 @@ step("map has more places than labels", base.places > base.labels, base.status);
 const defaults = await evaluate(`(() => {
   const boxes = [...document.querySelectorAll('#categories input[data-cat]')]
     .filter(b => b.dataset.sub === undefined);
+  const named = (b) => b.closest(".cat-row").querySelector(".name").textContent;
   return {
     total: boxes.length,
-    off: boxes.filter(b => !b.checked)
-      .map(b => b.closest(".cat-row").querySelector(".name").textContent),
+    all: boxes.map(named),
+    off: boxes.filter(b => !b.checked).map(named),
   };
 })()`);
 step(
@@ -124,6 +125,18 @@ step(
   defaults.total === 0
     ? "the category panel had not rendered yet"
     : `${defaults.total} categories, off: ${JSON.stringify(defaults.off)}`
+);
+step(
+  "People is a category of its own",
+  defaults.all.includes("People"),
+  JSON.stringify(defaults.all)
+);
+step(
+  // It is the layer the map did not have, and it duplicates nothing on the
+  // basemap underneath, so it is the one new category that starts visible.
+  "People starts switched on",
+  defaults.all.includes("People") && !defaults.off.includes("People"),
+  `off: ${JSON.stringify(defaults.off)}`
 );
 
 // --- 2. unchecking a category removes its items -----------------------------
@@ -164,6 +177,85 @@ const subs = await evaluate(`(async () => {
   return { open: panel.classList.contains("open"), count: panel.querySelectorAll("label").length };
 })()`);
 step("subcategories expand", subs.open && subs.count > 5, JSON.stringify(subs));
+
+// --- 3b. the selection is in the URL ----------------------------------------
+// A screenshot cannot show which categories are ticked, so the link has to. Both
+// directions are checked, because either one alone is useless: the hash has to
+// carry a change out, and a pasted hash has to bring one in.
+const shared = await evaluate(`(async () => {
+  const rows = () => [...document.querySelectorAll("#categories .cat-row")];
+  const row = (name) => rows().find(r => r.querySelector(".name")?.textContent === name);
+  const box = (name) => row(name).querySelector('input[type="checkbox"]');
+  const catBoxes = () => [...document.querySelectorAll(
+    '#categories input[data-cat]:not([data-sub])')];
+  const checkedNames = () => catBoxes().filter(b => b.checked)
+    .map(b => b.closest(".cat-row").querySelector(".name").textContent);
+
+  const manifest = await (await fetch("data/manifest.json")).json();
+  const nature = manifest.categories.find(c => c.name === "Nature").id;
+
+  // out: unticking a category has to show up in the hash
+  const defaultHash = location.hash;
+  box("Nature").click();
+  await ${sleep(900)};
+  const afterToggle = location.hash;
+
+  // in: a link somebody else made, with one subcategory of one category
+  location.hash = "#4.00/48.0000/9.0000/cat=" + nature + "~1";
+  await ${sleep(2500)};
+  const applied = {
+    hash: location.hash,
+    cats: checkedNames(),
+    subs: [...document.querySelectorAll(
+      '#categories input[data-cat="' + nature + '"][data-sub]')]
+      .filter(b => b.checked).map(b => Number(b.dataset.sub)),
+    places: Number(/of ([\\d,]+) places/.exec(
+      document.getElementById("status-text").textContent)[1].replace(/,/g, "")),
+  };
+
+  // a link with no selection means "however the map opens"
+  location.hash = "#3.40/47.0000/8.0000";
+  await ${sleep(2500)};
+  const reset = checkedNames();
+  // and once it is back to the default, the hash should stop mentioning it
+  box("Nature").click();
+  await ${sleep(500)};
+  box("Nature").click();
+  await ${sleep(900)};
+  return { defaultHash, afterToggle, applied, reset, backToDefault: location.hash };
+})()`);
+step(
+  "the default selection is not spelled out in the hash",
+  !/cat=/.test(shared.defaultHash),
+  shared.defaultHash
+);
+step(
+  "unticking a category writes it into the hash",
+  /cat=/.test(shared.afterToggle),
+  shared.afterToggle
+);
+step(
+  "a shared link applies its category selection",
+  shared.applied.cats.length === 1 &&
+    shared.applied.cats[0] === "Nature" &&
+    JSON.stringify(shared.applied.subs) === "[1]",
+  JSON.stringify(shared.applied)
+);
+step(
+  "a shared link still moves the map",
+  /^#4\.00\//.test(shared.applied.hash) && shared.applied.places > 0,
+  JSON.stringify(shared.applied)
+);
+step(
+  "a link with no selection restores the defaults",
+  shared.reset.length > 1 && !shared.reset.includes("Settlements"),
+  JSON.stringify(shared.reset)
+);
+step(
+  "the hash drops the selection again once it is the default",
+  !/cat=/.test(shared.backToDefault),
+  shared.backToDefault
+);
 
 // --- 4. search finds a place and flies to it --------------------------------
 const search = await evaluate(`(async () => {
@@ -238,6 +330,73 @@ step(
   panel.links.length === 4 && panel.links[0].startsWith("Wikipedia"),
   JSON.stringify(panel.links)
 );
+
+// --- 5b. an item at a borrowed coordinate says so ---------------------------
+// A person is drawn at their birthplace, nudged aside so the others born there
+// are still reachable. Everything the panel says about position therefore has
+// to be hedged - and the map links have to be gone, because they would drop a
+// pin on a spot this map invented.
+const borrowed = await evaluate(`(async () => {
+  const mod = await import("./src/ui.js");
+  const manifest = await (await fetch("data/manifest.json")).json();
+  const p = new mod.DetailPanel({
+    panel: document.getElementById("detail"),
+    body: document.getElementById("detail-body"),
+    closeButton: document.getElementById("detail-close"),
+    categories: manifest,
+  });
+  const item = {
+    qid: 937, title: "Albert Einstein", wiki: "Albert Einstein", wikiLang: "en",
+    position: [9.9937, 48.4011], score: 0.9, pr: 0.9, qr: 0.9,
+    cat: manifest.peopleCat, sub: 1, hasImage: true,
+    descr: "German-born theoretical physicist",
+    pop: null, elev: null, year: 1879, sitelinks: 255,
+    country: "Germany", admin: "Ulm", locSrc: 1, derived: true,
+  };
+  p.open(item);
+  await ${sleep(3500)};
+  const body = document.getElementById("detail-body");
+  const dts = [...body.querySelectorAll("dt")].map(d => d.textContent);
+  const dds = [...body.querySelectorAll("dd")].map(d => d.textContent);
+  return {
+    meta: body.querySelector(".meta")?.textContent ?? "",
+    facts: Object.fromEntries(dts.map((k, i) => [k, dds[i]])),
+    links: [...body.querySelectorAll(".links a")].map(a => a.textContent),
+    place: mod.formatPlace(item, manifest),
+  };
+})()`);
+step(
+  "a derived location reads as 'born in Ulm, Germany'",
+  borrowed.place === "born in Ulm, Germany",
+  JSON.stringify(borrowed.place)
+);
+step(
+  "the panel names the place it borrowed from",
+  (borrowed.facts["Born in"] ?? "") === "Ulm",
+  JSON.stringify(borrowed.facts)
+);
+step(
+  "the position is flagged as approximate",
+  /approximate/i.test(borrowed.facts["Position"] ?? ""),
+  JSON.stringify(borrowed.facts["Position"])
+);
+step(
+  "no exact coordinates are claimed for a borrowed point",
+  !("Coordinates" in borrowed.facts),
+  JSON.stringify(borrowed.facts["Coordinates"])
+);
+step(
+  "a person's year is labelled as a birth, not a founding",
+  "Born" in borrowed.facts && !("Founded" in borrowed.facts),
+  JSON.stringify(Object.keys(borrowed.facts))
+);
+step(
+  "map links are withheld for an invented coordinate",
+  borrowed.links.length === 2 &&
+    !borrowed.links.some(l => /OpenStreetMap|Google/.test(l)),
+  JSON.stringify(borrowed.links)
+);
+await evaluate(`document.getElementById("detail-close").click()`);
 // The new tile columns have to survive all the way to the panel, or paying
 // 20% on the pyramid for descr_en bought nothing.
 step(

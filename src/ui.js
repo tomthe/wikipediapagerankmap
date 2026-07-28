@@ -36,20 +36,36 @@ export function formatYear(year) {
   return year < 0 ? `${nf.format(-year)} BC` : String(year);
 }
 
-/** Country and admin area, without repeating a city-state's own name. */
-export function formatPlace(item) {
+/**
+ * Country and admin area, without repeating a city-state's own name.
+ *
+ * For an item drawn at a coordinate it does not own - a person at their
+ * birthplace, a painting at its museum - `admin` holds that place's name and
+ * the phrase from the manifest says how it got there: "born in Ulm, Germany".
+ * Without the preposition the line would read exactly like a place's own
+ * address and quietly assert that Einstein is a point in southern Germany.
+ */
+export function formatPlace(item, manifest) {
   const parts = [];
   if (item.admin && item.admin !== item.title) parts.push(item.admin);
   if (item.country && item.country !== item.title && item.country !== item.admin) {
     parts.push(item.country);
   }
-  return parts.join(", ");
+  const where = parts.join(", ");
+  if (!where) return "";
+  const phrase = item.derived ? manifest?.locSources?.[item.locSrc] : "";
+  return phrase ? `${phrase} ${where}` : where;
 }
 
 function kindOf(categories, item) {
   const cat = categories.categories[item.cat];
   const sub = cat?.subcategories?.[item.sub];
   return sub && sub !== "Other" ? `${sub} · ${cat.name}` : cat?.name ?? "";
+}
+
+/** A year means different things to a person and to a building. */
+function yearLabel(manifest, item) {
+  return item.cat === manifest?.peopleCat ? "Born" : "Founded";
 }
 
 export class Tooltip {
@@ -80,7 +96,7 @@ export class Tooltip {
 
     // Facts worth reading at a glance, and only the ones this item has.
     const facts = [
-      formatPlace(item),
+      formatPlace(item, this.categories),
       item.pop != null ? `pop. ${formatPopulation(item.pop)}` : null,
       item.elev != null ? `${nf.format(item.elev)} m` : null,
       formatYear(item.year),
@@ -102,16 +118,24 @@ export class Tooltip {
     this.el.append(rank);
 
     this.el.style.display = "block";
-    // Keep the tooltip on screen near the right and bottom edges.
-    const box = this.el.getBoundingClientRect();
-    const left = Math.min(x + 14, window.innerWidth - box.width - 8);
-    const top = Math.min(y + 14, window.innerHeight - box.height - 8);
-    this.el.style.left = `${left}px`;
-    this.el.style.top = `${top}px`;
+    // Measured once here and kept for move(): the map reports every pointer
+    // move, and reading the box on each one would put a forced layout on the
+    // path of a mouse drag.
+    this.box = this.el.getBoundingClientRect();
+    this.move(x, y);
+  }
+
+  /** Reposition without rebuilding, keeping the tooltip clear of the right and
+   *  bottom edges. Same content, so the size measured by show() still holds. */
+  move(x, y) {
+    if (!this.box) return;
+    this.el.style.left = `${Math.min(x + 14, window.innerWidth - this.box.width - 8)}px`;
+    this.el.style.top = `${Math.min(y + 14, window.innerHeight - this.box.height - 8)}px`;
   }
 
   hide() {
     this.el.style.display = "none";
+    this.box = null;
   }
 }
 
@@ -143,7 +167,10 @@ export class DetailPanel {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = [kindOf(this.categories, item), formatPlace(item)]
+    meta.textContent = [
+      kindOf(this.categories, item),
+      formatPlace(item, this.categories),
+    ]
       .filter(Boolean)
       .join(" · ");
 
@@ -168,9 +195,22 @@ export class DetailPanel {
     };
     addFact("Population", formatPopulation(item.pop));
     addFact("Elevation", item.elev != null ? `${nf.format(item.elev)} m` : null);
-    addFact("Founded", formatYear(item.year));
+    addFact(yearLabel(this.categories, item), formatYear(item.year));
     addFact("Country", item.country);
-    addFact("Admin area", item.admin);
+    if (item.derived) {
+      // The dot is not where this thing is - it is where the place it points
+      // at is, nudged aside so the other people born there are reachable too.
+      // Saying so costs one line and is the difference between a map and a
+      // wrong map.
+      const phrase = this.categories?.locSources?.[item.locSrc] || "at";
+      addFact(
+        phrase.charAt(0).toUpperCase() + phrase.slice(1),
+        item.admin || "an unnamed place"
+      );
+      addFact("Position", "approximate — spread around that place");
+    } else {
+      addFact("Admin area", item.admin);
+    }
     addFact(
       "Language editions",
       item.sitelinks ? (item.sitelinks >= 255 ? "255+" : String(item.sitelinks)) : null
@@ -178,7 +218,7 @@ export class DetailPanel {
     addFact("Importance", `${(item.score * 100).toFixed(1)} / 100`);
     addFact("PageRank", `${(item.pr * 100).toFixed(1)} / 100`);
     addFact("Pageviews", `${(item.qr * 100).toFixed(1)} / 100`);
-    addFact("Coordinates", `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+    if (!item.derived) addFact("Coordinates", `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
     addFact("Wikidata", `Q${item.qid}`);
 
     const links = document.createElement("div");
@@ -199,8 +239,12 @@ export class DetailPanel {
       );
     }
     addLink("Wikidata", `https://www.wikidata.org/wiki/Q${item.qid}`);
-    addLink("OpenStreetMap", `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=15/${lat}/${lon}`);
-    addLink("Google Maps", `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`);
+    // No map links for a borrowed, nudged coordinate: they would open a pin on
+    // a spot that exists only because this map had to draw the dot somewhere.
+    if (!item.derived) {
+      addLink("OpenStreetMap", `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=15/${lat}/${lon}`);
+      addLink("Google Maps", `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`);
+    }
 
     this.body.append(title, meta, figure, extract, facts, links);
     this.panel.classList.add("open");

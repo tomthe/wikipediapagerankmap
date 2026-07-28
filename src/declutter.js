@@ -27,6 +27,8 @@
 //   * max importance (in main.js) hide the loudest items so the next tier is
 //                 not competing with them at all.
 
+import { FONT_FAMILY, FONT_WEIGHT } from "./layers.js";
+
 const CELL = 20; // px; smaller than a label, so a box covers several cells
 const MARGIN = 140; // px of off-screen slack, so labels do not pop at the edge
 
@@ -45,7 +47,9 @@ function emWidth(text) {
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 8;
     context = canvas.getContext("2d");
-    context.font = '500 32px system-ui, -apple-system, "Segoe UI", sans-serif';
+    // The same font the labels are drawn in, from one definition - a box
+    // measured in a different face is a box of the wrong size.
+    context.font = `${FONT_WEIGHT} 32px ${FONT_FAMILY}`;
   }
   width = context.measureText(text).width / 32;
   emWidths.set(text, width);

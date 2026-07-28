@@ -10,6 +10,7 @@
 import { TileManager } from "./tiles.js";
 import { CategoryFilter } from "./categories.js";
 import { buildLayers, importanceOf, labelSize } from "./layers.js";
+import { LabelCanvas } from "./labelcanvas.js";
 import { selectLabels } from "./declutter.js";
 import { Search } from "./search.js";
 import { Tooltip, DetailPanel } from "./ui.js";
@@ -21,7 +22,10 @@ const DATA_URL = "data";
 // already favours - they dominate every zoom and mostly restate what the
 // basemap says. Starting with them off makes the first view show the things
 // people came for, and both are one click away.
-const DEFAULT_OFF = ["Settlements", "Administrative"];
+//
+// People deliberately starts ON. It is the layer this map did not have, and
+// unlike Settlements it duplicates nothing underneath it.
+const DEFAULT_OFF = ["Settlements", "Administrative", "People"];
 
 const $ = (id) => document.getElementById(id);
 
@@ -45,7 +49,17 @@ const state = {
   hovered: null,
 };
 
+// Which renderer draws the label text. "canvas" is the browser's own text
+// rasteriser, in labelcanvas.js, and the reason it is the default is written
+// down there. "sdf" is deck.gl's TextLayer, kept because it is the only way to
+// get the labels into the same WebGL canvas as the dots - and because switching
+// back has to stay a one-liner: set window.labelRenderer.labels = "sdf" in the
+// console and pan.
+const renderer = { labels: "canvas" };
+if (typeof window !== "undefined") window.labelRenderer = renderer;
+
 let deckgl;
+let labelCanvas;
 let tiles;
 let filter;
 let tooltip;
@@ -55,23 +69,62 @@ let scheduled = null;
 
 // ---------------------------------------------------------------- view state
 
+// The hash is `#zoom/lat/lon`, optionally followed by `/key=value` segments -
+// today only `cat=`, the category selection (see src/categories.js for its
+// grammar). Splitting on `/` and sorting segments into "number" and "key=value"
+// means an old three-part link still works and an unknown key is ignored rather
+// than throwing the view away.
 function readHash() {
-  const match = /^#(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)$/.exec(
-    location.hash
+  const raw = location.hash.replace(/^#/, "");
+  if (!raw) return {};
+  const link = {};
+  const numbers = [];
+  for (const segment of raw.split("/")) {
+    const pair = /^([a-z]+)=(.*)$/.exec(segment);
+    if (pair) link[pair[1]] = pair[2];
+    else numbers.push(Number(segment));
+  }
+  const [zoom, latitude, longitude] = numbers;
+  if (
+    numbers.length >= 3 &&
+    numbers.slice(0, 3).every(Number.isFinite) &&
+    Math.abs(latitude) <= 90
+  ) {
+    link.view = { zoom, latitude, longitude, pitch: 0, bearing: 0 };
+  }
+  return link;
+}
+
+function hashFor() {
+  const { zoom, latitude, longitude } = state.viewState;
+  const cats = filter?.urlValue();
+  return (
+    `#${zoom.toFixed(2)}/${latitude.toFixed(4)}/${longitude.toFixed(4)}` +
+    (cats ? `/cat=${cats}` : "")
   );
-  if (!match) return null;
-  const [, zoom, latitude, longitude] = match.map(Number);
-  return { zoom, latitude, longitude, pitch: 0, bearing: 0 };
 }
 
 let hashTimer = null;
+let ownHash = "";
 function writeHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
-    const { zoom, latitude, longitude } = state.viewState;
-    const hash = `#${zoom.toFixed(2)}/${latitude.toFixed(4)}/${longitude.toFixed(4)}`;
-    history.replaceState(null, "", hash);
+    ownHash = hashFor();
+    history.replaceState(null, "", ownHash);
   }, 300);
+}
+
+/** Someone pasted a link into a tab that is already open. `replaceState` does
+ *  not fire `hashchange`, so anything arriving here came from outside, and the
+ *  whole link is applied - including a missing `cat=`, which means the default
+ *  selection, because that is what the sharer was looking at. */
+function onHashChange() {
+  if (location.hash === ownHash) return;
+  const link = readHash();
+  filter.apply(link.cat ?? filter.defaultEncoded);
+  if (link.view) state.viewState = { ...state.viewState, ...link.view };
+  render({ reselect: true });
+  scheduleTiles();
 }
 
 function currentViewport() {
@@ -146,13 +199,26 @@ function render({ reselect = false } = {}) {
     labelled,
     style: state.style,
     theme: state.theme,
-    onHover,
-    onClick,
+    textLayers: renderer.labels !== "canvas",
   });
   deckgl.setProps({ layers, viewState: state.viewState });
+  // The label canvas itself is redrawn from onAfterRender rather than here, so
+  // that it tracks the camera deck actually drew with - including the frames of
+  // a flyTo transition, which deck animates internally without coming back
+  // through render().
+  if (renderer.labels !== "canvas") labelCanvas?.clear();
   filter.updateCounts(items);
   updateStatus(visibleCount, labelled.length, displacedCount);
   return items;
+}
+
+/** Redraw the label overlay onto the camera deck.gl just drew with. */
+function drawLabels() {
+  if (!labelCanvas || renderer.labels !== "canvas") return;
+  const viewport = deckgl?.getViewports?.()?.[0];
+  if (!viewport) return;
+  labelCanvas.prepare({ labelled, style: state.style, theme: state.theme });
+  labelCanvas.draw(viewport);
 }
 
 function scheduleTiles() {
@@ -181,14 +247,36 @@ function updateStatus(inView, labelCount, displaced) {
  *  items. Both should hover the same thing. */
 const itemOf = (object) => (object && object.item ? object.item : object) ?? null;
 
+/**
+ * What is under the pointer. deck picks the dots (and, on the sdf path, the
+ * labels); the canvas renderer keeps its own screen rectangles, and it is
+ * asked first because its labels are drawn on top of everything deck draws.
+ * Both are driven by deck's hover events, which fire on every pointer move
+ * whether or not anything was picked.
+ */
+function pickAt(info) {
+  return labelCanvas?.pick(info.x, info.y) ?? itemOf(info.object);
+}
+
+// Read by getCursor. deck evaluates that when it handles a pointer event, so
+// this is at worst one event stale - a frame, and invisible.
+let hoveringItem = false;
+
 function onHover(info) {
-  const item = itemOf(info.object);
-  state.hovered = item;
-  tooltip.show(item, info.x, info.y);
+  const item = pickAt(info);
+  hoveringItem = Boolean(item);
+  // Every pointer move arrives here, not just entering and leaving an item, so
+  // the tooltip is only rebuilt when it would actually say something different.
+  if (item !== state.hovered) {
+    state.hovered = item;
+    tooltip.show(item, info.x, info.y);
+  } else if (item) {
+    tooltip.move(info.x, info.y);
+  }
 }
 
 function onClick(info) {
-  const item = itemOf(info.object);
+  const item = pickAt(info);
   if (item) detail.open(item);
 }
 
@@ -304,9 +392,10 @@ function wireControls() {
     render();
   });
 
-  // Starts false because two categories start off, so the first click should
-  // turn everything on rather than clear what is already a partial selection.
-  let allOn = false;
+  // False unless everything is already on, so the first click turns everything
+  // on rather than being a no-op on a partial selection - which is what the
+  // default two-categories-off state is, and what a shared link usually is too.
+  let allOn = filter.encode() === "all";
   $("cat-all").addEventListener("click", () => {
     allOn = !allOn;
     filter.setAll(allOn);
@@ -363,13 +452,25 @@ async function start() {
   state.style.palette = manifest.palette[state.theme];
   document.documentElement.dataset.theme = state.theme;
 
+  const link = readHash();
+
   filter = new CategoryFilter({
     manifest,
     container: $("categories"),
     defaultOff: DEFAULT_OFF,
-    onChange: () => render({ reselect: true }),
+    // The selection is in the URL, so every change to it rewrites the hash -
+    // that is the whole of "share what I can see".
+    onChange: () => {
+      render({ reselect: true });
+      writeHash();
+    },
   });
   filter.setPalette(state.style.palette);
+  // A token this manifest cannot make sense of leaves the defaults alone rather
+  // than opening a blank map.
+  if (link.cat !== undefined && !filter.apply(link.cat)) {
+    console.warn(`ignoring an unusable category selection: cat=${link.cat}`);
+  }
 
   tiles = new TileManager({
     pack,
@@ -377,8 +478,7 @@ async function start() {
     onUpdate: () => render({ reselect: true }),
   });
 
-  const fromHash = readHash();
-  if (fromHash) state.viewState = { ...state.viewState, ...fromHash };
+  if (link.view) state.viewState = { ...state.viewState, ...link.view };
 
   deckgl = new deck.DeckGL({
     container: "map",
@@ -387,8 +487,19 @@ async function start() {
     controller: { doubleClickZoom: false, inertia: 250 },
     onViewStateChange,
     layers: [],
-    getCursor: ({ isHovering }) => (isHovering ? "pointer" : "grab"),
+    // At the deck level rather than per layer, because the canvas renderer's
+    // labels are not deck objects and only the root callback fires on every
+    // pointer move rather than on entering and leaving a layer's objects.
+    onHover,
+    onClick,
+    onAfterRender: drawLabels,
+    getCursor: ({ isHovering }) =>
+      isHovering || hoveringItem ? "pointer" : "grab",
   });
+
+  // Inside #map, above deck's canvas. #map does not create a stacking context,
+  // so the overlay's z-index still sits below the panels at 10.
+  labelCanvas = new LabelCanvas($("map"));
 
   tooltip = new Tooltip($("tooltip"), { categories: manifest });
   detail = new DetailPanel({
@@ -407,6 +518,7 @@ async function start() {
     `${(manifest.pack.bytes / 1e6).toFixed(0)} MB in ${manifest.pack.parts.length} file(s)`;
 
   window.addEventListener("resize", () => scheduleTiles());
+  window.addEventListener("hashchange", onHashChange);
   $("loading").classList.add("hidden");
 
   scheduleTiles();

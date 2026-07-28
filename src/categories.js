@@ -11,6 +11,132 @@ export function hexToRgb(hex) {
 
 const SUB_STRIDE = 256;
 
+// ------------------------------------------------------------ URL encoding
+//
+// A selection is half of what a shared link has to carry - the other half is
+// where the map is looking - so it is written with characters a URL fragment
+// leaves alone: `.` between categories, `~` for "only these subcategories",
+// `!` for "all but these", `3-7` for a run. Nothing here ever needs escaping,
+// which is what keeps the hash readable in a chat window.
+//
+//   cat=all                 everything
+//   cat=none                nothing
+//   cat=0.2.9               those three categories, all of their subcategories
+//   cat=0~1,3-5.9!0         Other: only subs 1 and 3-5; People: all but sub 0
+//
+// Ids rather than names because the hash is already the longest thing on the
+// URL bar, and because a name would have to be escaped the moment somebody
+// renames a category to something with a space in it.
+
+/** Sorted indices -> "1,3-7,9". Runs collapse, which is the common case: most
+ *  partial selections are "all of them except the one I just unticked". */
+function encodeList(indices) {
+  const runs = [];
+  for (const i of indices) {
+    const last = runs[runs.length - 1];
+    if (last && i === last[1] + 1) last[1] = i;
+    else runs.push([i, i]);
+  }
+  return runs
+    .map(([a, b]) => (a === b ? `${a}` : b === a + 1 ? `${a},${b}` : `${a}-${b}`))
+    .join(",");
+}
+
+/** "1,3-7" -> [1,3,4,5,6,7]; null if it is not that shape. Indices at or past
+ *  `limit` are dropped rather than rejected, so a link made before a category
+ *  gained or lost a subcategory still resolves to something sensible. */
+function parseList(text, limit) {
+  if (text === "") return [];
+  const out = [];
+  for (const piece of text.split(",")) {
+    const match = /^(\d+)(?:-(\d+))?$/.exec(piece);
+    if (!match) return null;
+    const from = Number(match[1]);
+    const to = match[2] === undefined ? from : Number(match[2]);
+    if (to < from || to - from > SUB_STRIDE) return null;
+    for (let i = from; i <= to; i++) if (i < limit) out.push(i);
+  }
+  return out;
+}
+
+/** The whole filter state as one URL-safe token. */
+export function encodeSelection(categories, catOn, subOn) {
+  const parts = [];
+  let everyCategoryFull = true;
+  let anythingOn = false;
+  for (const cat of categories) {
+    const count = cat.subcategories.length;
+    const on = catOn.get(cat.id)
+      ? [...subOn.get(cat.id)].filter((i) => i < count).sort((a, b) => a - b)
+      : [];
+    if (on.length === 0) {
+      everyCategoryFull = false;
+      continue;
+    }
+    anythingOn = true;
+    if (on.length === count) {
+      parts.push(String(cat.id));
+      continue;
+    }
+    everyCategoryFull = false;
+    const chosen = new Set(on);
+    const off = [];
+    for (let i = 0; i < count; i++) if (!chosen.has(i)) off.push(i);
+    const only = `${cat.id}~${encodeList(on)}`;
+    const except = `${cat.id}!${encodeList(off)}`;
+    parts.push(except.length < only.length ? except : only);
+  }
+  if (!anythingOn) return "none";
+  if (everyCategoryFull) return "all";
+  return parts.join(".");
+}
+
+/** Inverse of encodeSelection. Returns `{ catOn, subOn }`, or null when the
+ *  token says nothing this manifest recognises - a caller that gets null should
+ *  keep the default selection rather than draw an empty map. */
+export function parseSelection(text, categories) {
+  if (!text) return null;
+  const catOn = new Map(categories.map((c) => [c.id, false]));
+  const subOn = new Map(categories.map((c) => [c.id, new Set()]));
+  const turnOn = (cat) => {
+    catOn.set(cat.id, true);
+    const set = subOn.get(cat.id);
+    cat.subcategories.forEach((_, i) => set.add(i));
+  };
+  if (text === "none") return { catOn, subOn };
+  if (text === "all") {
+    for (const cat of categories) turnOn(cat);
+    return { catOn, subOn };
+  }
+  const byId = new Map(categories.map((c) => [c.id, c]));
+  let understood = false;
+  for (const part of text.split(".")) {
+    const match = /^(\d+)(?:([~!])([\d,-]*))?$/.exec(part);
+    if (!match) continue;
+    const cat = byId.get(Number(match[1]));
+    if (!cat) continue;
+    if (!match[2]) {
+      turnOn(cat);
+      understood = true;
+      continue;
+    }
+    const listed = parseList(match[3], cat.subcategories.length);
+    if (!listed) continue;
+    const set = subOn.get(cat.id);
+    if (match[2] === "~") {
+      for (const i of listed) set.add(i);
+    } else {
+      const off = new Set(listed);
+      cat.subcategories.forEach((_, i) => {
+        if (!off.has(i)) set.add(i);
+      });
+    }
+    catOn.set(cat.id, set.size > 0);
+    if (set.size > 0) understood = true;
+  }
+  return understood ? { catOn, subOn } : null;
+}
+
 export class CategoryFilter {
   constructor({ manifest, container, onChange, defaultOff = [] }) {
     this.categories = manifest.categories;
@@ -29,10 +155,41 @@ export class CategoryFilter {
     );
     this.countEls = new Map();
     this.render();
+    // What the site starts with. A shared link carries a selection only when it
+    // differs from this, so a plain `#zoom/lat/lon` link keeps meaning "however
+    // the map opens" even if the defaults are changed later.
+    this.defaultEncoded = this.encode();
   }
 
   accept(item) {
     return this.lookup[item.cat * SUB_STRIDE + item.sub] === 1;
+  }
+
+  encode() {
+    return encodeSelection(this.categories, this.catOn, this.subOn);
+  }
+
+  /** The token for the URL, or null when nothing needs saying. */
+  urlValue() {
+    const encoded = this.encode();
+    return encoded === this.defaultEncoded ? null : encoded;
+  }
+
+  /** Apply an encoded selection. Returns false and changes nothing if the token
+   *  is unusable. Does not fire onChange: the caller is the one that knows
+   *  whether a redraw is already coming. */
+  apply(text) {
+    const parsed = parseSelection(text, this.categories);
+    if (!parsed) return false;
+    for (const cat of this.categories) {
+      this.catOn.set(cat.id, parsed.catOn.get(cat.id));
+      const set = this.subOn.get(cat.id);
+      set.clear();
+      for (const sub of parsed.subOn.get(cat.id)) set.add(sub);
+    }
+    this.rebuildLookup();
+    this.syncInputs();
+    return true;
   }
 
   rebuildLookup() {

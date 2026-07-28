@@ -28,11 +28,18 @@ from pipeline.build_tiles import (
     FLAG_HAS_IMAGE,
     FLAG_HAS_WEBSITE,
     FLAG_HAS_WIKI,
+    FLAG_LOC_MASK,
+    FLAG_LOC_SHIFT,
     NO_INT16,
     NO_POP,
     NO_REF,
     encode_tile,
 )
+
+
+def loc(code: int) -> int:
+    """The flag bits for a location source, e.g. loc(1) = "born here"."""
+    return code << FLAG_LOC_SHIFT
 
 REPO = Path(__file__).resolve().parent.parent
 COUNTRIES = ["United Kingdom", "Japan", "Israel", "Germany", "Philippines", "France"]
@@ -121,6 +128,38 @@ CASES = [
         ],
     },
     {
+        # The location-source bits share the flags byte with the three
+        # has-a-thing bits, so the case that matters is both sets at once: a
+        # shift or mask that is off by one still passes if only one is used.
+        "name": "every location source, alongside the other flag bits",
+        "rows": [
+            row(937, 10.0, 48.4, 50000, 40000, 30000, 9, 1,
+                FLAG_HAS_WIKI | FLAG_HAS_IMAGE | loc(1), "Albert Einstein", "en|",
+                descr="theoretical physicist", admin="Ulm", country=3, year=1879,
+                sitelinks=255),
+            row(859, -74.66, 40.35, 40000, 30000, 20000, 9, 1,
+                FLAG_HAS_WIKI | loc(2), "Someone Who Died", "en|",
+                admin="Princeton", country=5),
+            row(12418, 2.3364, 48.8606, 60000, 50000, 55000, 6, 17,
+                FLAG_HAS_WIKI | FLAG_HAS_IMAGE | FLAG_HAS_WEBSITE | loc(3),
+                "Mona Lisa", "en|", descr="painting by Leonardo da Vinci",
+                admin="Louvre", country=5, year=1503),
+            row(95, 0.0, 51.5, 30000, 20000, 25000, 8, 26,
+                FLAG_HAS_WIKI | loc(4), "A Company", "en|", admin="London",
+                country=0),
+            row(42, 1.0, 2.0, 20000, 10000, 15000, 6, 22, loc(5),
+                "A Novel", "", admin="Somewhere"),
+            row(43, 3.0, 4.0, 20000, 10000, 15000, 4, 12,
+                FLAG_HAS_WEBSITE | loc(6), "A Ship", "", admin="Portsmouth"),
+            row(44, 5.0, 6.0, 20000, 10000, 15000, 9, 2,
+                FLAG_HAS_IMAGE | loc(7), "Someone Associated", "",
+                admin="Vienna"),
+            # Code 0 next to them: an ordinary item must stay non-derived.
+            row(45, 7.0, 8.0, 20000, 10000, 15000, 1, 2, FLAG_HAS_WIKI,
+                "An Actual Place", "en|", admin="Vienna"),
+        ],
+    },
+    {
         # Three rows, so the u16 block is 14*3 bytes and the encoder has to pad
         # before the u8 block. An even count hides that bug completely.
         "name": "odd row count, sharing one admin area, values at the limits",
@@ -182,6 +221,8 @@ def build(rows: list[dict]) -> tuple[bytes, list[dict]]:
                 "descr": r["descr"],
                 "hasImage": bool(r["flags"] & FLAG_HAS_IMAGE),
                 "hasWebsite": bool(r["flags"] & FLAG_HAS_WEBSITE),
+                "locSrc": (r["flags"] >> FLAG_LOC_SHIFT) & FLAG_LOC_MASK,
+                "derived": ((r["flags"] >> FLAG_LOC_SHIFT) & FLAG_LOC_MASK) != 0,
                 "cat": r["cat"],
                 "sub": r["sub"],
                 "pop": None if r["pop"] == NO_POP else r["pop"],
@@ -199,6 +240,10 @@ def build(rows: list[dict]) -> tuple[bytes, list[dict]]:
 
 
 def main() -> None:
+    # The fixtures are deliberately full of astral-plane and RTL titles, and a
+    # cp1252 console cannot print them - so a real mismatch used to die inside
+    # the diff instead of showing it.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     node, env = find_node()
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:

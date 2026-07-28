@@ -7,6 +7,137 @@ The data is created from wikidata dump and pagerank datasets. Then converted int
 
 ##
 
+@README.md 
+
+* add People and other stuff that are only indirectly geolocated
+  * No Human has a geolocation in Wikidata, but more than half have a birthplace or other associated regions
+  * For Humans, pets and maybe some more categories (which ones?), we could choose birthplace (or death or other regions), look up thoose coordinates and use them. (e.g. Albert Einstein's Wikidata entry has many residences, birthplace (Ulm), place of death (Princeton), employers...) Place of birth is most often there and most informative. Place of death if place of birth is not available.
+  *which other categories would be fun or informative?
+
+The problem: this would change the whole data, which is commited and transfered to github already. Can we rewrite history a bit? Please just plan this.
+
+This also has to be its own category with subcategories.
+
+Claude's plan:
+"""
+Read the pipeline, the tile format and the git history. Here's the plan — no changes made.
+
+1. Do the git surgery first, before rebuilding anything
+That ordering matters: rewriting now costs one rewrite; rebuilding first and then rewriting means the 459 MB is in history twice while you work.
+
+Current state is unusually favourable. data/ entered history in exactly one commit (4dfa952, 4 back from HEAD), nothing after it touches data/, and the 436 MB is still loose objects (git count-objects: in-pack 5 objects / 5.77 KiB). So no git filter-repo is needed — a plain rebase drops it, and a local gc reclaims it immediately.
+
+
+git branch backup-with-data                      # safety net, delete later
+git rebase --onto 4a0db1e 4dfa952 master         # replay the 3 code commits, drop the data commit
+The three replayed commits touch src/, index.html, README.md only, and the data commit touched .gitignore + data/* — disjoint, so no conflicts. Dropping it also restores data/* in .gitignore automatically (that commit is what commented it out).
+
+Then publish site+data as a single-root-commit orphan branch, built with plumbing so it never touches your worktree and never accumulates history:
+
+
+GIT_INDEX_FILE=.git/publish.idx git add -f index.html src data
+tree=$(GIT_INDEX_FILE=.git/publish.idx git write-tree)
+commit=$(git commit-tree $tree -m "publish 2026-07-27")   # no -p: no parent, no history
+git push -f origin $commit:refs/heads/gh-pages
+git push --force-with-lease origin master
+git reflog expire --expire=now --all && git gc --prune=now
+Worth making that tools/publish.sh. Every republish replaces the branch wholesale, so the remote holds exactly one copy of the data forever, regardless of how many times you rebuild. Then flip Settings → Pages → source to gh-pages/root.
+
+Three caveats to be honest about:
+
+Force-pushing rewrites public history. Any existing clone needs git fetch && git reset --hard origin/master. Solo repo, so probably nobody.
+GitHub does not immediately reclaim the unreachable old blobs; the repo's reported size stays high until their gc runs. You can ask support to run it, or ignore it — it doesn't block pushes at this size.
+Your local .git will still hold ~460 MB after a publish (the objects have to exist locally to be pushed). One copy, not N.
+Alternative worth considering given the data is about to grow: put data/ in a Cloudflare R2 public bucket (CORS on, DATA_URL in main.js) and keep git code-only permanently. Range requests work, egress is free, and the "git can't forget" problem disappears rather than being managed. Plan A above is the no-new-account option; this is the one I'd pick if you expect to rebuild more than a couple of times.
+
+2. Pipeline: derived locations
+extract_truthy.py: add PIDs to the existing alternations — near-free, no extra pass over the dump.
+
+RE_ITEM: P(31|279|17|131|37|19|20|106|551|937|159|276) — birthplace, place of death, occupation, residence, work location, headquarters, location.
+RE_TIME: P(571|569|570) — inception plus birth/death dates.
+claims_item grows maybe 15% (P106 is ~2 values × 12.6M humans). Validate with --limit-gb 20 first: it exercises the new regexes on ~2% of the dump and gives you the real P19-coverage ratio before committing 67 minutes.
+
+build_master.py: the whole file is anchored on geo = items with P625. Add a second source and union it:
+
+
+derived AS (            -- resolve the referenced place's real coordinate
+  SELECT c.qid, g.lon, g.lat, c.pid AS loc_src, g.qid AS loc_qid
+  FROM claims_item c JOIN geo g ON g.qid = c.value
+  WHERE c.pid IN (19,20,551,937,159,276)
+    AND c.qid NOT IN (SELECT qid FROM geo)
+  QUALIFY row_number() OVER (PARTITION BY c.qid
+          ORDER BY list_position([19,20,551,937,159,276], c.pid)) = 1
+)
+Four things fall out of that and each is a decision, not a detail:
+
+Only real P625 items are location sources (join against geo, not geo_all), so nothing chains person → person. Worth a one-hop P131 fallback when the birthplace itself has no coordinate (a Gemeinde that only has a parent).
+country/admin come from the source place, not the person. People have P27 citizenship, not P17; inheriting Ulm's country and admin area makes the existing tooltip read correctly with zero new columns.
+Volume needs a floor. Roughly 12.6M humans, over half with P19 — on the order of 7M new rows, which would nearly double the pyramid and push you at the 1 GB Pages limit. Add --derived-min-score / require ≥1 sitelink; targeting 1.5–2.5M people costs ~+50–75 MB of tiles. Make it a CLI flag so you can see both.
+The scores of everything else shift. Normalisation is within the geolocated subset, so adding 2M people moves pr_pct/qr_pct and every tile boundary. This is unavoidable and is exactly why the data has to be republished wholesale.
+build_tiles.py: two real problems.
+
+Coincident points. Everyone born in Paris lands on one coordinate. Deterministic phyllotaxis jitter — the k-th person at a place (score order) at radius R·√(k/K), golden-angle apart, R from the place's population, clamped to [200 m, 8 km]. Deterministic, no RNG, spreads evenly. It does invent a coordinate, which is why the tooltip must always say "born in Ulm" rather than implying the person is there.
+Deepest-zoom blowup. assign_zoom gives z=12 everything left over, so a Paris z12 tile could hold 100k people and become a multi-MB download. Needs a cap at max zoom with an explicit drop (and a printed count of what was dropped), or the floor above has to do the work.
+Encoding is nearly free: flags bits 3–4 carry the location source (0 own / 1 born / 2 died / 3 other), year carries the birth year for people, admin reuses the per-tile string table for the place name, pop/elev stay sentinel. So a person costs about what a place costs — name + description — and nothing structural.
+
+3. The category, and the colour problem
+People as a 9th category with subcategories is straightforward mechanically: taxonomy.py's anchor + P279-BFS machinery works unchanged on the occupation hierarchy, seeded with ~20 anchors (Politician, Scientist, Writer, Artist, Musician, Actor, Athlete, Religious, Military, Nobility, Businessperson, Philosopher, Physician, Explorer, …), resolved from P106 instead of P31, falling back to sub 0 = "Person". cat/sub are u8, so there's headroom.
+
+The friction is colour. PALETTE is 8 hues + a deliberate neutral for "Other", validated under all-pairs colour-vision gates — that's the ceiling, not a stylistic choice. Options, in the order I'd try them:
+
+Re-run the palette validator for 9 hues + neutral. It may pass; if it does, done.
+If it doesn't: give People the neutral slot and separate them with a non-colour channel — italic labels and a hollow dot. That's arguably better anyway, because it's the same signal as "this location is derived", which no other category needs.
+Also: main.js DEFAULT_OFF — I'd leave People on by default. It's the interesting new layer, and unlike Settlements it isn't duplicating the basemap.
+
+4. Which other categories are fun
+Ranked by payoff/effort, all using the same derived machinery:
+
+Battles and historical events (P276, many already have coords) — a war map falls out for free.
+Works of art (P276 = the museum holding them) — the Mona Lisa in the Louvre. Small, high-value, unambiguous.
+Companies and organisations (P159 headquarters) — folds into Economy & services with no new category.
+Novels and films by narrative setting (P840) — the most genuinely novel layer here: a map of where fiction is set. Small dataset, high delight.
+Skip: filming locations (P915, noisy), citizenship-based placement (country centroid is a lie), fictional characters (they'd need their own honesty treatment).
+Note that P19-only is the honest default for people: place of death as fallback where birth is missing, as you wrote, and the flag bits make the two distinguishable in the tooltip.
+
+5. Cost, and what else has to move
+Tiles 408 MB → ~470–520 MB; search 50 → ~60–70 MB. Comfortable against Pages' 1 GB if the orphan-branch scheme is in place first.
+
+Touched beyond the above: decode.js (flag bits), ui.js (the "where is it" line becomes "born in Ulm, Germany"), layers.js (italic if you take option 2), build_search.py (no change beyond the floor). Tests: make_fake_master.py needs the new columns, test_tile_format.py the flag round trip, test_build_master.py the derived join on synthetic shards, interaction_check.mjs the People filter and the derived-location tooltip.
+
+Sequencing
+Git surgery + publish.sh + switch Pages to gh-pages — do it now, verify the live site still works off the current data.
+extract_truthy --limit-gb 20 with the new PIDs; measure real P19/P106 coverage; pick the floor from data rather than from my estimate.
+Full pipeline rerun (~1 h + 15 min).
+Client changes and tests against the new build.
+Publish; README's "eight coloured categories" and hosting sections need rewriting either way.
+Two things I'd want your call on before step 2: the score floor for people (how many is "the right number" — 1.5M keeps it cheap, 7M is everyone), and whether to jitter or leave people stacked exactly on their birthplace and let the existing displacement + leader lines cope.
+"""
+
+--> please implement it as planned.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##
+
 ok, I want all the information in the tiles, includung all the descr_en (20% is great for the value added)
 I also want to be able to tune the sizes of labels by population, for entities with a population.
 

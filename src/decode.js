@@ -12,11 +12,21 @@
 //       elevation i16[n], year i16[n],                            (pad to 4)
 //       cat u8[n], sub u8[n], flags u8[n], sitelinks u8[n],
 //       adminOff u32[adminCount+1], adminBlob, titles, wikis, descrs
+//
+// Items with a non-zero location source are drawn at somebody else's
+// coordinate - a person at their birthplace, a painting at its museum. The
+// decoder surfaces that as `locSrc`/`derived` so nothing downstream can
+// accidentally present a borrowed point as the item's own position.
 
 const MAGIC = 0x32544d57; // "WMT2" read as a little-endian uint32
 const FLAG_HAS_WIKI = 1;
 const FLAG_HAS_IMAGE = 2;
 const FLAG_HAS_WEBSITE = 4;
+// Bits 3-5: why the item is at this coordinate. 0 means it has its own; any
+// other value means the coordinate was borrowed from the place named in
+// `admin`, and manifest.locSources[locSrc] is the phrase that says which way.
+const FLAG_LOC_SHIFT = 3;
+const FLAG_LOC_MASK = 0b111;
 
 const NO_POP = 0xffffffff;
 const NO_REF = 0xffff;
@@ -107,6 +117,8 @@ export function decodeTile(buffer, countries = []) {
         : "",
       hasImage: !!(flags[i] & FLAG_HAS_IMAGE),
       hasWebsite: !!(flags[i] & FLAG_HAS_WEBSITE),
+      locSrc: (flags[i] >> FLAG_LOC_SHIFT) & FLAG_LOC_MASK,
+      derived: ((flags[i] >> FLAG_LOC_SHIFT) & FLAG_LOC_MASK) !== 0,
       score: score[i] / 65535,
       pr: pr[i] / 65535,
       qr: qr[i] / 65535,
