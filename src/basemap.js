@@ -16,6 +16,8 @@
 //
 // Attribution is required and their style JSON does not carry it, so it is
 // attached to the sources here, where MapLibre's attribution control finds it.
+//
+// The water is also faded - see fadeWater below.
 
 const STYLE_URL = {
   light: "https://tiles.openfreemap.org/styles/positron",
@@ -26,6 +28,46 @@ const ATTRIBUTION =
   '<a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> ' +
   '&copy; <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> ' +
   'Data from <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>';
+
+// How far the water is faded toward the land underneath it.
+//
+// A label's halo is only as good as the contrast between the halo colour and
+// what is behind it, and water is the one large surface that sits well away
+// from the land tone: positron paints it rgb(194,200,202) against rgb(242,243,
+// 240) of land, so a white halo over the sea gives up most of its separation.
+// Water is drawn straight onto the background - park is the only fill beneath
+// it and that one is on land - so simply making it more transparent blends it
+// toward the land colour, without having to parse and mix the style's own
+// colours (which arrive as rgb(), hsl() and hex, sometimes as expressions).
+//
+// Dark fades less. Its water is *lighter* than its land, rgb(27,27,29) against
+// rgb(12,12,12), so the problem is the same one mirrored - but it starts from
+// 15 levels of contrast rather than 48, and fading it as hard as positron
+// would erase the coastline to buy back very little halo.
+const WATER_FADE = { light: 0.45, dark: 0.65 };
+
+/**
+ * Fade the water fills and the rivers drawn on top of them.
+ *
+ * Multiplies rather than assigns, so a style that already fades a layer (or
+ * zoom-interpolates its opacity, in which case there is nothing sensible to
+ * multiply and the fade is used as-is) is not overridden into being *more*
+ * opaque than its author intended.
+ */
+function fadeWater(style, theme) {
+  const fade = WATER_FADE[theme] ?? 1;
+  for (const layer of style.layers) {
+    const sourceLayer = layer["source-layer"];
+    if (sourceLayer !== "water" && sourceLayer !== "waterway") continue;
+    const key = { fill: "fill-opacity", line: "line-opacity" }[layer.type];
+    if (!key) continue;
+    const current = layer.paint?.[key];
+    layer.paint = {
+      ...layer.paint,
+      [key]: typeof current === "number" ? current * fade : fade,
+    };
+  }
+}
 
 /** Land-coloured nothing, for when the style server cannot be reached. */
 function fallbackStyle(theme) {
@@ -57,6 +99,7 @@ export async function basemapStyle(theme) {
       style.layers = style.layers.filter(
         (layer) => !(layer.layout && layer.layout["text-field"])
       );
+      fadeWater(style, theme);
       for (const source of Object.values(style.sources ?? {})) {
         source.attribution = ATTRIBUTION;
       }

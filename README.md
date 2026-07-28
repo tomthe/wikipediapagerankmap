@@ -553,6 +553,17 @@ does not carry it, so it is attached to the sources where MapLibre's
 attribution control finds it. If the style server cannot be reached, the labels
 are drawn on plain ground rather than not at all.
 
+The water is also faded — 45 % opacity in `positron`, 65 % in `dark`. A label's
+halo is worth only the contrast between it and what is behind it, and water is
+the one large surface that sits well away from the land tone: `positron` paints
+it rgb(194,200,202) against rgb(242,243,240) of land, so a white halo over the
+sea gives up most of its separation. Water is drawn straight onto the
+background, so raising its transparency blends it toward the land colour
+without having to parse and mix the style's own colours, which arrive as
+`rgb()`, `hsl()` and hex. `dark` fades less: its water is *lighter* than its
+land and starts from 15 levels of contrast rather than 48, so fading it as hard
+would erase the coastline to buy back very little.
+
 ## Tests
 
 ```sh
@@ -700,6 +711,62 @@ Size comes from importance by default. **Size by population** blends
 one; items without a population keep their importance and stay comparable, so
 the slider does not make the mountains vanish. The blended value drives the
 collision order too, so whatever is drawn bigger also wins.
+
+### Label contrast
+
+Labels are drawn from a signed-distance field, which is what allows a halo. The
+field is generated as `1 - (distance/radius + cutoff)` and the shader reads 0.75
+as the glyph edge, so everything below is arithmetic on those two numbers.
+
+deck exposes two knobs over it — `fontSettings.smoothing`, the half-width of the
+alpha ramp at the glyph edge, and `outlineWidth`, which sets the threshold the
+halo runs out to — and **neither is scaled by the size a label is drawn at**.
+In pixels they come out as
+
+```
+ramp = 2 * smoothing * (radius / fontSize) * drawnPx * dpr
+halo = (0.75 - outlineBuffer - smoothing) * (radius / fontSize) * drawnPx * dpr
+```
+
+so exactly one label size gets a one-pixel edge. At deck's defaults that size is
+~16 device pixels: below it there is less than a pixel of ramp left, the glyph
+edge stops being antialiased at all and one-pixel stems snap on and off between
+pixels; above it the edge goes soft. Most labels here are 10–14 CSS pixels, so
+on a 1× display the whole map sat on the aliased side — a 12 px label had 0.44
+pixels of ramp, which is what "mangled at the pixel level" looks like.
+
+So `src/layers.js` inverts it: the pixel widths are the input (`labelTuning`, a
+1.0 px ramp and a 1.6 px solid halo, live on `window` so they can be tried from
+the console) and the two uniforms are solved for, per size bucket and for the
+display the page is on. There are two buckets because one master cannot serve 9
+and 46 pixels — the small labels get minified past their stems, the large ones
+magnified — and because a bucket is a size range the solve can be right about.
+`buffer` has to hold the whole field, which reaches `0.75 * radius`, so the two
+move together.
+
+Note also that `outlineWidth` saturates: `max(smoothing, 0.75 * (1 - w))` means
+every `w` above `1 - smoothing/0.75` is the same value, and `outlineWidth: 2.5`
+draws exactly what `1` draws.
+
+The halo is **black in both themes**, which is not the obvious choice in light.
+A near-black halo around near-black ink does not separate the text from the
+ground; it merges with it and the two read as one heavier letter — and that is
+the point. At 10–14 px a white halo is a fringe pushed into the counters of e,
+a and o and between the stems of m, so it thins and breaks the letterforms it
+is there to protect. A dark halo thickens them. What it gives up is contrast
+against dark ground, which is what the faded water buys back (see
+[The basemap](#the-basemap)). It is opaque for the same reason the width is
+solved rather than guessed: the outer edge is already a gradient, so a halo
+below full alpha is faded twice.
+
+What none of this fixes is that deck positions each glyph quad at a fractional
+device pixel with no hinting, so at 10–14 px the stems land wherever they land
+and letters differ in weight within a word. Native rasterisers snap stems to
+the pixel grid; an SDF atlas cannot. The way out of that is to stop using one —
+draw the labels into a 2D canvas with `fillText`/`strokeText`, which also puts
+the halo width in real pixels and lets positions be rounded onto the grid.
+`declutter.js` already computes the screen boxes, so picking would become a box
+test and deck would keep only the dots.
 
 ### Interaction
 

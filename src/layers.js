@@ -26,6 +26,107 @@ const POP_LOG_MAX = 8; // 100,000,000
 // Below this the label is close enough to its dot to be unambiguous.
 const LEADER_MIN_PX = 12;
 
+// Drawn label size is clamped to this range, and the buckets below are cut in
+// the same units, so a label lands in the bucket it is actually drawn at.
+const SIZE_MIN = 9;
+const SIZE_MAX = 46;
+
+// Halo colour, per theme. Opaque: the outer edge is a gradient already, so a
+// halo below full alpha is faded twice and its tail stops separating the text
+// from anything.
+//
+// Black in both themes, which is not the obvious choice in light. A near-black
+// halo around near-black ink does not separate the text from the ground, it
+// merges with it and the two read as one heavier letter - and that is the
+// point. At 10 to 14 pixels a white halo is a fringe pushed into the counters
+// of e, a and o and between the stems of m, so it thins and breaks the very
+// letterforms it is there to protect. A dark halo thickens them instead. What
+// it gives up is contrast against dark ground, which is what the faded water
+// in basemap.js buys back.
+const HALO = {
+  light: [255, 255, 255, 255],
+  dark: [8, 8, 8, 255],
+};
+
+// Antialiasing and halo width, in device pixels.
+//
+// deck draws SDF text with two uniforms, and neither is scaled by the size a
+// label is drawn at. `smoothing` is the half-width of the alpha ramp at the
+// glyph edge; `outlineWidth` sets the threshold the halo runs out to. Both are
+// in distance-field units, so in pixels they come out as
+//
+//   ramp = 2 * smoothing * (radius / fontSize) * drawnPx * dpr
+//   halo = (0.75 - outlineBuffer - smoothing) * (radius / fontSize) * drawnPx * dpr
+//
+// which means exactly one label size gets a one-pixel edge. At deck's defaults
+// that size is about 16 device pixels: below it there is less than a pixel of
+// ramp left, the edge stops being antialiased at all and one-pixel stems snap
+// on and off between pixels; above it the edge goes soft. Most labels here are
+// 10 to 14 CSS pixels, so on a 1x display the whole map sat on the aliased
+// side - a 12 pixel label had 0.44 pixels of ramp.
+//
+// So the pixel widths are the input here and the uniforms are solved for, per
+// size bucket and for the display the page is actually on. Both are read every
+// render and exposed as window.labelTuning, so they can be tried from the
+// console - set one, pan, and the next frame uses it.
+export const labelTuning = {
+  ramp: 2.4, // device px of antialiasing at the glyph edge
+  halo: 1.0, // device px of solid halo before it fades out; 0 for none at all
+};
+if (typeof window !== "undefined") window.labelTuning = labelTuning;
+
+// One master per size range. A single atlas cannot serve 9 and 46 pixels: the
+// small labels get minified past their stems, the large ones magnified, and
+// the uniforms above can only be right about one size at a time anyway. Two
+// keep every label within about a factor of two of its own master, and give
+// the solve two ranges to be right about. `buffer` is the glyph's padding in
+// the atlas and has to hold the whole field, which reaches 0.75 * radius;
+// `tunedFor` is the size within the bucket the solve aims at.
+const BUCKETS = [
+  { name: "small", maxPx: 20, fontSize: 24, buffer: 6, radius: 8, tunedFor: 14 },
+  { name: "large", maxPx: Infinity, fontSize: 48, buffer: 12, radius: 15, tunedFor: 30 },
+];
+
+/** deck's two SDF uniforms, solved backwards from the pixel widths wanted. */
+function sdfProps({ fontSize, buffer, radius, tunedFor }, dpr) {
+  // Field units per device pixel, at the size this bucket is tuned for.
+  const unit = fontSize / (radius * tunedFor * dpr);
+  const smoothing = Math.min(0.25, Math.max(0.01, (labelTuning.ramp * unit) / 2));
+  const fontSettings = { sdf: true, fontSize, buffer, radius, smoothing };
+  if (!(labelTuning.halo > 0)) return { fontSettings, outlineWidth: 0 };
+  // The halo runs from the glyph edge at 0.75 down to the threshold plus one
+  // ramp, clamped at `smoothing` - as far out as the field reaches.
+  const outlineBuffer = Math.max(
+    smoothing,
+    0.75 - smoothing - labelTuning.halo * unit
+  );
+  // Inverted through deck's own max(smoothing, 0.75 * (1 - outlineWidth)).
+  return { fontSettings, outlineWidth: 1 - outlineBuffer / 0.75 };
+}
+
+const bucketFor = (size) => BUCKETS.findIndex((bucket) => size <= bucket.maxPx);
+
+// Which bucket each label is in changes only when the selection or one of the
+// sliders feeding label size does. Recomputing the split per render would hand
+// the text layers a new data array on every pan frame, and re-tessellating a
+// few hundred titles into glyphs is not free - so cache it against the
+// `labelled` array, which main.js keeps stable between selections.
+let splitCache = { labelled: null, key: null, groups: null };
+
+function splitBySize(labelled, style) {
+  const key = `${style.qrankWeight} ${style.populationWeight} ${style.labelScale}`;
+  if (splitCache.labelled === labelled && splitCache.key === key) {
+    return splitCache.groups;
+  }
+  const groups = BUCKETS.map(() => []);
+  for (const placement of labelled) {
+    const size = labelSize(placement.item, style);
+    groups[bucketFor(Math.min(SIZE_MAX, Math.max(SIZE_MIN, size)))].push(placement);
+  }
+  splitCache = { labelled, key, groups };
+  return groups;
+}
+
 /** Mix the two importance signals the way the slider asks for. */
 export function importanceOf(item, qrankWeight) {
   return item.pr * (1 - qrankWeight) + item.qr * qrankWeight;
@@ -59,7 +160,7 @@ export function labelSize(item, style) {
 export function buildLayers({ items, labelled, style, theme, onHover, onClick }) {
   const colors = style.palette.map(hexToRgb);
   const ink = theme === "dark" ? [242, 242, 240] : [17, 17, 16];
-  const halo = theme === "dark" ? [8, 8, 8, 210] : [255, 255, 255, 225];
+  const halo = HALO[theme] ?? HALO.light;
   const leader = theme === "dark" ? [140, 140, 136, 150] : [110, 110, 105, 140];
   const dotAlpha = theme === "dark" ? 190 : 165;
   const { qrankWeight, labelScale, populationWeight, colorByCategory, labelBudget } =
@@ -117,34 +218,38 @@ export function buildLayers({ items, labelled, style, theme, onHover, onClick })
     updateTriggers: { getColor: triggers },
   });
 
-  const labels = new TextLayer({
-    id: "labels",
-    data: labelled,
-    pickable: true,
-    getPosition: (d) => d.position,
-    getText: (d) => d.item.title,
-    getSize: (d) => labelSize(d.item, style),
-    sizeUnits: "pixels",
-    sizeMinPixels: 9,
-    sizeMaxPixels: 46,
-    getColor: (d) => (colorByCategory ? colors[d.item.cat] : ink),
-    getTextAnchor: "middle",
-    getAlignmentBaseline: "center",
-    fontFamily: FONT_FAMILY,
-    fontWeight: 500,
-    characterSet: "auto",
-    // A signed-distance field is what makes the halo possible, and the halo is
-    // what keeps a label readable over coastlines and roads.
-    fontSettings: { sdf: true, fontSize: 52, buffer: 12, radius: 16 },
-    outlineWidth: 2.5,
-    outlineColor: halo,
-    updateTriggers: { getSize: triggers, getColor: triggers },
-    onHover,
-    onClick,
-  });
+  // One layer per size bucket. Same layer in every respect but the master the
+  // glyphs come from and the two uniforms solved for it.
+  const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+  const groups = splitBySize(labelled, style);
+  const labels = BUCKETS.map(
+    (bucket, i) =>
+      new TextLayer({
+        id: `labels-${bucket.name}`,
+        data: groups[i],
+        pickable: true,
+        getPosition: (d) => d.position,
+        getText: (d) => d.item.title,
+        getSize: (d) => labelSize(d.item, style),
+        sizeUnits: "pixels",
+        sizeMinPixels: SIZE_MIN,
+        sizeMaxPixels: SIZE_MAX,
+        getColor: (d) => (colorByCategory ? colors[d.item.cat] : ink),
+        getTextAnchor: "middle",
+        getAlignmentBaseline: "center",
+        fontFamily: FONT_FAMILY,
+        fontWeight: 500,
+        characterSet: "auto",
+        outlineColor: halo,
+        ...sdfProps(bucket, dpr),
+        updateTriggers: { getSize: triggers, getColor: triggers },
+        onHover,
+        onClick,
+      })
+  );
 
   return {
-    layers: [dots, leaders, labels],
+    layers: [dots, leaders, ...labels],
     visibleCount: items.length,
     labelledCount: labelled.length,
     displacedCount: displaced.length,
