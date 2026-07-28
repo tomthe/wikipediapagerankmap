@@ -118,16 +118,24 @@ export class Tooltip {
     this.el.append(rank);
 
     this.el.style.display = "block";
-    // Keep the tooltip on screen near the right and bottom edges.
-    const box = this.el.getBoundingClientRect();
-    const left = Math.min(x + 14, window.innerWidth - box.width - 8);
-    const top = Math.min(y + 14, window.innerHeight - box.height - 8);
-    this.el.style.left = `${left}px`;
-    this.el.style.top = `${top}px`;
+    // Measured once here and kept for move(): the map reports every pointer
+    // move, and reading the box on each one would put a forced layout on the
+    // path of a mouse drag.
+    this.box = this.el.getBoundingClientRect();
+    this.move(x, y);
+  }
+
+  /** Reposition without rebuilding, keeping the tooltip clear of the right and
+   *  bottom edges. Same content, so the size measured by show() still holds. */
+  move(x, y) {
+    if (!this.box) return;
+    this.el.style.left = `${Math.min(x + 14, window.innerWidth - this.box.width - 8)}px`;
+    this.el.style.top = `${Math.min(y + 14, window.innerHeight - this.box.height - 8)}px`;
   }
 
   hide() {
     this.el.style.display = "none";
+    this.box = null;
   }
 }
 

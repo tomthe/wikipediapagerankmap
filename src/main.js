@@ -10,6 +10,7 @@
 import { TileManager } from "./tiles.js";
 import { CategoryFilter } from "./categories.js";
 import { buildLayers, importanceOf, labelSize } from "./layers.js";
+import { LabelCanvas } from "./labelcanvas.js";
 import { selectLabels } from "./declutter.js";
 import { Search } from "./search.js";
 import { Tooltip, DetailPanel } from "./ui.js";
@@ -48,7 +49,17 @@ const state = {
   hovered: null,
 };
 
+// Which renderer draws the label text. "canvas" is the browser's own text
+// rasteriser, in labelcanvas.js, and the reason it is the default is written
+// down there. "sdf" is deck.gl's TextLayer, kept because it is the only way to
+// get the labels into the same WebGL canvas as the dots - and because switching
+// back has to stay a one-liner: set window.labelRenderer.labels = "sdf" in the
+// console and pan.
+const renderer = { labels: "canvas" };
+if (typeof window !== "undefined") window.labelRenderer = renderer;
+
 let deckgl;
+let labelCanvas;
 let tiles;
 let filter;
 let tooltip;
@@ -188,13 +199,26 @@ function render({ reselect = false } = {}) {
     labelled,
     style: state.style,
     theme: state.theme,
-    onHover,
-    onClick,
+    textLayers: renderer.labels !== "canvas",
   });
   deckgl.setProps({ layers, viewState: state.viewState });
+  // The label canvas itself is redrawn from onAfterRender rather than here, so
+  // that it tracks the camera deck actually drew with - including the frames of
+  // a flyTo transition, which deck animates internally without coming back
+  // through render().
+  if (renderer.labels !== "canvas") labelCanvas?.clear();
   filter.updateCounts(items);
   updateStatus(visibleCount, labelled.length, displacedCount);
   return items;
+}
+
+/** Redraw the label overlay onto the camera deck.gl just drew with. */
+function drawLabels() {
+  if (!labelCanvas || renderer.labels !== "canvas") return;
+  const viewport = deckgl?.getViewports?.()?.[0];
+  if (!viewport) return;
+  labelCanvas.prepare({ labelled, style: state.style, theme: state.theme });
+  labelCanvas.draw(viewport);
 }
 
 function scheduleTiles() {
@@ -223,14 +247,36 @@ function updateStatus(inView, labelCount, displaced) {
  *  items. Both should hover the same thing. */
 const itemOf = (object) => (object && object.item ? object.item : object) ?? null;
 
+/**
+ * What is under the pointer. deck picks the dots (and, on the sdf path, the
+ * labels); the canvas renderer keeps its own screen rectangles, and it is
+ * asked first because its labels are drawn on top of everything deck draws.
+ * Both are driven by deck's hover events, which fire on every pointer move
+ * whether or not anything was picked.
+ */
+function pickAt(info) {
+  return labelCanvas?.pick(info.x, info.y) ?? itemOf(info.object);
+}
+
+// Read by getCursor. deck evaluates that when it handles a pointer event, so
+// this is at worst one event stale - a frame, and invisible.
+let hoveringItem = false;
+
 function onHover(info) {
-  const item = itemOf(info.object);
-  state.hovered = item;
-  tooltip.show(item, info.x, info.y);
+  const item = pickAt(info);
+  hoveringItem = Boolean(item);
+  // Every pointer move arrives here, not just entering and leaving an item, so
+  // the tooltip is only rebuilt when it would actually say something different.
+  if (item !== state.hovered) {
+    state.hovered = item;
+    tooltip.show(item, info.x, info.y);
+  } else if (item) {
+    tooltip.move(info.x, info.y);
+  }
 }
 
 function onClick(info) {
-  const item = itemOf(info.object);
+  const item = pickAt(info);
   if (item) detail.open(item);
 }
 
@@ -441,8 +487,19 @@ async function start() {
     controller: { doubleClickZoom: false, inertia: 250 },
     onViewStateChange,
     layers: [],
-    getCursor: ({ isHovering }) => (isHovering ? "pointer" : "grab"),
+    // At the deck level rather than per layer, because the canvas renderer's
+    // labels are not deck objects and only the root callback fires on every
+    // pointer move rather than on entering and leaving a layer's objects.
+    onHover,
+    onClick,
+    onAfterRender: drawLabels,
+    getCursor: ({ isHovering }) =>
+      isHovering || hoveringItem ? "pointer" : "grab",
   });
+
+  // Inside #map, above deck's canvas. #map does not create a stacking context,
+  // so the overlay's z-index still sits below the panels at 10.
+  labelCanvas = new LabelCanvas($("map"));
 
   tooltip = new Tooltip($("tooltip"), { categories: manifest });
   detail = new DetailPanel({

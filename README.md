@@ -656,7 +656,8 @@ and the deepest-zoom budget both have something to bite on.
 | `src/tiles.js` | `TileManager` — what to load, caching, aborting, eviction |
 | `src/decode.js` | the binary tile decoder |
 | `src/declutter.js` | screen-space label selection and displacement |
-| `src/layers.js` | deck.gl label, leader-line and dot layers |
+| `src/layers.js` | deck.gl dot, leader-line and (unused by default) text layers |
+| `src/labelcanvas.js` | the labels, drawn with `fillText` onto a canvas over deck's |
 | `src/categories.js` | category/subcategory filter, panel, and its URL form |
 | `src/search.js` | prefix search against the packed shards |
 | `src/basemap.js` | OpenFreeMap style, with the text layers removed |
@@ -735,38 +736,71 @@ pixels; above it the edge goes soft. Most labels here are 10–14 CSS pixels, so
 on a 1× display the whole map sat on the aliased side — a 12 px label had 0.44
 pixels of ramp, which is what "mangled at the pixel level" looks like.
 
-So `src/layers.js` inverts it: the pixel widths are the input (`labelTuning`, a
-1.0 px ramp and a 1.6 px solid halo, live on `window` so they can be tried from
-the console) and the two uniforms are solved for, per size bucket and for the
-display the page is on. There are two buckets because one master cannot serve 9
-and 46 pixels — the small labels get minified past their stems, the large ones
-magnified — and because a bucket is a size range the solve can be right about.
-`buffer` has to hold the whole field, which reaches `0.75 * radius`, so the two
-move together.
+So `src/layers.js` inverts it: the pixel widths are the input (`labelTuning`,
+live on `window` so they can be tried from the console) and the two uniforms are
+solved for, per size bucket and for the display the page is on. There are two
+buckets because one master cannot serve 9 and 46 pixels — the small labels get
+minified past their stems, the large ones magnified — and because a bucket is a
+size range the solve can be right about. `buffer` has to hold the whole field,
+which reaches `0.75 * radius`, so the two move together.
+
+The ramp is set to **2.4 px, not the textbook 1.0**, which is the interesting
+result. A one-pixel ramp is correct antialiasing and it looked worse. At 10–14
+px the sampling noise from minifying the master is larger than the letterform
+detail, so a wide ramp wins by low-pass filtering the noise away: the glyphs go
+soft but their weight stops varying letter to letter, and even weight is what
+reads. Sharp-but-eroded loses to soft-but-even. Note the `smoothing` clamp at
+0.25 binds in the small bucket on a 1× display, so ramp values above ~2.33 are
+all the same picture there.
 
 Note also that `outlineWidth` saturates: `max(smoothing, 0.75 * (1 - w))` means
 every `w` above `1 - smoothing/0.75` is the same value, and `outlineWidth: 2.5`
 draws exactly what `1` draws.
 
-The halo is **black in both themes**, which is not the obvious choice in light.
-A near-black halo around near-black ink does not separate the text from the
-ground; it merges with it and the two read as one heavier letter — and that is
-the point. At 10–14 px a white halo is a fringe pushed into the counters of e,
-a and o and between the stems of m, so it thins and breaks the letterforms it
-is there to protect. A dark halo thickens them. What it gives up is contrast
-against dark ground, which is what the faded water buys back (see
-[The basemap](#the-basemap)). It is opaque for the same reason the width is
-solved rather than guessed: the outer edge is already a gradient, so a halo
-below full alpha is faded twice.
+A black halo in light was tried, on the theory that a white one at 10–14 px is a
+fringe pushed into the counters of e, a and o and between the stems of m —
+thinning the letterforms it is there to protect — where a dark one would thicken
+them. It does thicken them, and it looks worse: the letters go muddy and the
+category colours go muddier. The halo is white over the light basemap and black
+over the dark one, opaque in both, because its outer edge is a gradient already
+and a colour below full alpha is faded twice.
 
-What none of this fixes is that deck positions each glyph quad at a fractional
-device pixel with no hinting, so at 10–14 px the stems land wherever they land
-and letters differ in weight within a word. Native rasterisers snap stems to
-the pixel grid; an SDF atlas cannot. The way out of that is to stop using one —
-draw the labels into a 2D canvas with `fillText`/`strokeText`, which also puts
-the halo width in real pixels and lets positions be rounded onto the grid.
-`declutter.js` already computes the screen boxes, so picking would become a box
-test and deck would keep only the dots.
+### Labels on a canvas
+
+None of the above fixes the floor: deck positions each glyph quad at a
+fractional device pixel with no hinting, so the stems land wherever they land
+and letters differ in weight within a word. Native rasterisers snap stems to the
+pixel grid; an SDF atlas cannot. `src/labelcanvas.js` is the way out — the
+labels are drawn with `fillText` onto a 2D canvas over deck's, which hints the
+stems, antialiases per size, takes a halo width in real pixels, and lets each
+label be rounded onto the pixel grid. It is the default; `window.labelRenderer`
+switches back to the distance field for comparison.
+
+The cost is CPU: rasterising text is orders of magnitude dearer than drawing a
+textured quad, and 1,500 labels × 2 (stroke and fill) per frame would not hold
+60fps. So it is split the way the declutter pass already splits — the labels are
+rasterised **once into a single atlas canvas** when the selection or a size
+slider changes, and every frame after that is one `drawImage` per label out of
+that atlas. Panning rasterises nothing and re-uploads no texture. One atlas
+rather than a canvas per label, because a few hundred small canvases are a few
+hundred textures for the compositor, and past a browser-specific limit they stop
+being GPU-backed at all, which turns every blit into an upload.
+
+What it gives up:
+
+* **A hitch when the atlas rebuilds.** ~300 labels is a few milliseconds, 1,500
+  is tens. It lands on the frame after the view settles, which is already the
+  frame that re-declutters.
+* **Labels creep against the basemap by up to half a pixel** while panning,
+  because they snap to whole device pixels and the map under them does not. That
+  snapping is most of what makes them crisp; `canvasLabelTuning.snap` turns it
+  off to show the trade.
+* **Two renderers to keep in step.** Hover and click are handled at the deck
+  level in `main.js` and ask the canvas first, since its labels are on top of
+  everything deck draws. The overlay is `pointer-events: none`, so deck keeps
+  dragging, zooming and picking the dots.
+* **Atlas memory**, roughly 4 bytes per device pixel of drawn text — a few MB at
+  the default density, ~15 MB at 1,500 labels on a 2× display.
 
 ### Interaction
 

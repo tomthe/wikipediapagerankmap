@@ -12,7 +12,13 @@ import { hexToRgb } from "./categories.js";
 
 const { TextLayer, ScatterplotLayer, LineLayer } = deck;
 
-const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+// Exported because three places have to agree about the font: the renderer
+// that draws the labels, the pass that measures them to reserve collision
+// boxes, and whichever of the two renderers is not in use. A mismatch here is
+// a label whose box is the wrong size, which shows up as text that overlaps
+// or as gaps where nothing was allowed to go.
+export const FONT_FAMILY = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+export const FONT_WEIGHT = 500;
 
 // log10 bounds the population term is stretched across. Anchoring the low end
 // at a real floor (a small town, not zero) instead of log10(1) means that
@@ -28,22 +34,28 @@ const LEADER_MIN_PX = 12;
 
 // Drawn label size is clamped to this range, and the buckets below are cut in
 // the same units, so a label lands in the bucket it is actually drawn at.
-const SIZE_MIN = 9;
-const SIZE_MAX = 46;
+export const SIZE_MIN = 9;
+export const SIZE_MAX = 46;
 
-// Halo colour, per theme. Opaque: the outer edge is a gradient already, so a
-// halo below full alpha is faded twice and its tail stops separating the text
-// from anything.
+/** The size a label is really drawn at, clamps included. */
+export function drawnSize(item, style) {
+  return Math.min(SIZE_MAX, Math.max(SIZE_MIN, labelSize(item, style)));
+}
+
+// Ink and halo, per theme. Opaque halo: its outer edge is a gradient already,
+// so a colour below full alpha is faded twice and the tail stops separating the
+// text from anything.
 //
-// Black in both themes, which is not the obvious choice in light. A near-black
-// halo around near-black ink does not separate the text from the ground, it
-// merges with it and the two read as one heavier letter - and that is the
-// point. At 10 to 14 pixels a white halo is a fringe pushed into the counters
-// of e, a and o and between the stems of m, so it thins and breaks the very
-// letterforms it is there to protect. A dark halo thickens them instead. What
-// it gives up is contrast against dark ground, which is what the faded water
-// in basemap.js buys back.
-const HALO = {
+// A black halo in light was tried, on the theory that a white one at 10 to 14
+// pixels is a fringe pushed into the counters of e, a and o and between the
+// stems of m - thinning the letterforms it is there to protect - where a dark
+// one would thicken them instead. It does thicken them, and it looks worse:
+// the letters go muddy and the category colours go muddier. White it is.
+export const INK = {
+  light: [17, 17, 16],
+  dark: [242, 242, 240],
+};
+export const HALO = {
   light: [255, 255, 255, 255],
   dark: [8, 8, 8, 255],
 };
@@ -120,8 +132,7 @@ function splitBySize(labelled, style) {
   }
   const groups = BUCKETS.map(() => []);
   for (const placement of labelled) {
-    const size = labelSize(placement.item, style);
-    groups[bucketFor(Math.min(SIZE_MAX, Math.max(SIZE_MIN, size)))].push(placement);
+    groups[bucketFor(drawnSize(placement.item, style))].push(placement);
   }
   splitCache = { labelled, key, groups };
   return groups;
@@ -157,9 +168,16 @@ export function labelSize(item, style) {
   return (10 + 30 * weight * weight) * style.labelScale;
 }
 
-export function buildLayers({ items, labelled, style, theme, onHover, onClick }) {
+/**
+ * @param textLayers draw the label text here, from the distance field. False
+ *        when labelcanvas.js is drawing it instead, in which case this builds
+ *        only the dots and the leader lines. Hovering and clicking are handled
+ *        at the deck level in main.js, so no layer here needs a callback: the
+ *        dots stay pickable and the canvas does its own hit testing.
+ */
+export function buildLayers({ items, labelled, style, theme, textLayers = true }) {
   const colors = style.palette.map(hexToRgb);
-  const ink = theme === "dark" ? [242, 242, 240] : [17, 17, 16];
+  const ink = INK[theme] ?? INK.light;
   const halo = HALO[theme] ?? HALO.light;
   const leader = theme === "dark" ? [140, 140, 136, 150] : [110, 110, 105, 140];
   const dotAlpha = theme === "dark" ? 190 : 165;
@@ -202,8 +220,6 @@ export function buildLayers({ items, labelled, style, theme, onHover, onClick })
       getLineColor: triggers,
       getLineWidth: triggers,
     },
-    onHover,
-    onClick,
   });
 
   const displaced = labelled.filter((p) => p.offset > LEADER_MIN_PX);
@@ -221,32 +237,32 @@ export function buildLayers({ items, labelled, style, theme, onHover, onClick })
   // One layer per size bucket. Same layer in every respect but the master the
   // glyphs come from and the two uniforms solved for it.
   const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
-  const groups = splitBySize(labelled, style);
-  const labels = BUCKETS.map(
-    (bucket, i) =>
-      new TextLayer({
-        id: `labels-${bucket.name}`,
-        data: groups[i],
-        pickable: true,
-        getPosition: (d) => d.position,
-        getText: (d) => d.item.title,
-        getSize: (d) => labelSize(d.item, style),
-        sizeUnits: "pixels",
-        sizeMinPixels: SIZE_MIN,
-        sizeMaxPixels: SIZE_MAX,
-        getColor: (d) => (colorByCategory ? colors[d.item.cat] : ink),
-        getTextAnchor: "middle",
-        getAlignmentBaseline: "center",
-        fontFamily: FONT_FAMILY,
-        fontWeight: 500,
-        characterSet: "auto",
-        outlineColor: halo,
-        ...sdfProps(bucket, dpr),
-        updateTriggers: { getSize: triggers, getColor: triggers },
-        onHover,
-        onClick,
-      })
-  );
+  const groups = textLayers ? splitBySize(labelled, style) : null;
+  const labels = !textLayers
+    ? []
+    : BUCKETS.map(
+        (bucket, i) =>
+          new TextLayer({
+            id: `labels-${bucket.name}`,
+            data: groups[i],
+            pickable: true,
+            getPosition: (d) => d.position,
+            getText: (d) => d.item.title,
+            getSize: (d) => labelSize(d.item, style),
+            sizeUnits: "pixels",
+            sizeMinPixels: SIZE_MIN,
+            sizeMaxPixels: SIZE_MAX,
+            getColor: (d) => (colorByCategory ? colors[d.item.cat] : ink),
+            getTextAnchor: "middle",
+            getAlignmentBaseline: "center",
+            fontFamily: FONT_FAMILY,
+            fontWeight: FONT_WEIGHT,
+            characterSet: "auto",
+            outlineColor: halo,
+            ...sdfProps(bucket, dpr),
+            updateTriggers: { getSize: triggers, getColor: triggers },
+          })
+      );
 
   return {
     layers: [dots, leaders, ...labels],
