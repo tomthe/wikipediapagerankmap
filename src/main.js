@@ -25,7 +25,7 @@ const DATA_URL = "data";
 //
 // People deliberately starts ON. It is the layer this map did not have, and
 // unlike Settlements it duplicates nothing underneath it.
-const DEFAULT_OFF = ["Settlements", "Administrative"];
+const DEFAULT_OFF = ["Settlements", "Administrative", "People"];
 
 const $ = (id) => document.getElementById(id);
 
